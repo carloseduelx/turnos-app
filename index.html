@@ -354,11 +354,12 @@ button, input, select, textarea {
 }
 
 .cal-day {
-  aspect-ratio: 1;
-  min-height: 56px;
+  min-height: 80px;
+  height: calc((100vh - 290px) / 6);
+  max-height: 110px;
   background: var(--panel);
   border-radius: 10px;
-  padding: 4px 5px;
+  padding: 5px 5px 8px;
   cursor: pointer;
   position: relative;
   display: flex;
@@ -376,7 +377,7 @@ button, input, select, textarea {
 .cal-day.selected { box-shadow: 0 0 0 2px var(--accent-2); }
 
 .cal-day-num {
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
   color: var(--text);
   align-self: flex-end;
@@ -386,9 +387,9 @@ button, input, select, textarea {
 .cal-day.weekend .cal-day-num { color: var(--text-dim); }
 
 .cal-day-shift {
-  font-size: 14px;
+  font-size: 18px;
   font-weight: 700;
-  margin-top: 2px;
+  margin-top: 6px;
   letter-spacing: 0.02em;
   color: var(--shift-color, var(--text));
   text-shadow: 0 1px 2px rgba(0,0,0,0.3);
@@ -405,20 +406,24 @@ button, input, select, textarea {
 
 .cal-day-note {
   position: absolute;
-  bottom: 3px;
-  left: 3px;
-  width: 5px; height: 5px;
+  bottom: 4px;
+  left: 4px;
+  width: 10px; height: 10px;
   background: var(--warning);
   border-radius: 50%;
+  border: 1.5px solid var(--bg);
+  box-shadow: 0 0 6px rgba(251, 191, 36, 0.7);
 }
 
 .cal-day-event {
   position: absolute;
-  bottom: 3px;
-  right: 3px;
-  width: 5px; height: 5px;
+  bottom: 4px;
+  right: 4px;
+  width: 10px; height: 10px;
   background: var(--info);
   border-radius: 50%;
+  border: 1.5px solid var(--bg);
+  box-shadow: 0 0 6px rgba(96, 165, 250, 0.7);
 }
 
 /* ============ DAY DETAIL SHEET ============ */
@@ -1245,12 +1250,31 @@ input[type="date"], input[type="time"], input[type="month"] {
 
   <!-- PAGE: EVENTS -->
   <div class="page" id="page-events">
-    <div style="padding:16px;">
-      <h2 style="margin:0 0 4px;font-size:22px;font-weight:700;">Citas y eventos</h2>
-      <p class="muted" style="margin:0 0 16px;">Eventos personales fuera del trabajo</p>
+    <div class="cal-header">
+      <div class="cal-month" id="evCalMonth"></div>
+      <div class="cal-nav">
+        <button onclick="changeEventMonth(-1)">‹</button>
+        <button onclick="goToEventToday()" style="width:auto;padding:0 12px;">Hoy</button>
+        <button onclick="changeEventMonth(1)">›</button>
+      </div>
+    </div>
+    <div class="cal-weekdays">
+      <div class="cal-weekday">L</div>
+      <div class="cal-weekday">M</div>
+      <div class="cal-weekday">X</div>
+      <div class="cal-weekday">J</div>
+      <div class="cal-weekday">V</div>
+      <div class="cal-weekday">S</div>
+      <div class="cal-weekday">D</div>
+    </div>
+    <div class="cal-grid" id="evCalGrid"></div>
+    <div style="padding:14px 16px 8px;">
       <button class="btn btn-block" onclick="openEventEditor()">+ Nuevo evento</button>
     </div>
-    <div id="eventsList" style="padding:0 16px;"></div>
+    <div style="padding:0 16px;">
+      <div class="section-title" style="margin:14px 0 8px;">Próximos eventos</div>
+      <div id="eventsList"></div>
+    </div>
   </div>
 
   <!-- PAGE: STATS -->
