@@ -41,6 +41,9 @@ let state = {
   statsMode: 'month',
   statsYear: new Date().getFullYear(),
   statsMonth: new Date().getMonth(),
+  evViewYear: new Date().getFullYear(),
+  evViewMonth: new Date().getMonth(),
+  evSelectedDate: null,
 };
 
 let firebase = null;
@@ -649,35 +652,144 @@ function applyPattern() {
 // EVENTS
 // ==========================================================================
 function renderEvents() {
+  // Render the events calendar
+  document.getElementById('evCalMonth').textContent = `${MONTHS[state.evViewMonth]} ${state.evViewYear}`;
+  
+  const grid = document.getElementById('evCalGrid');
+  grid.innerHTML = '';
+  
+  const firstDay = new Date(state.evViewYear, state.evViewMonth, 1);
+  const lastDay = new Date(state.evViewYear, state.evViewMonth + 1, 0);
+  let startWeekday = firstDay.getDay() - 1;
+  if (startWeekday < 0) startWeekday = 6;
+  
+  const prevLast = new Date(state.evViewYear, state.evViewMonth, 0).getDate();
+  for (let i = startWeekday - 1; i >= 0; i--) {
+    grid.appendChild(buildEventDayCell(state.evViewYear, state.evViewMonth - 1, prevLast - i, true));
+  }
+  
+  for (let d = 1; d <= lastDay.getDate(); d++) {
+    grid.appendChild(buildEventDayCell(state.evViewYear, state.evViewMonth, d, false));
+  }
+  
+  const totalCells = grid.children.length;
+  const cellsNeeded = Math.ceil(totalCells / 7) * 7;
+  for (let i = 1; i <= cellsNeeded - totalCells; i++) {
+    grid.appendChild(buildEventDayCell(state.evViewYear, state.evViewMonth + 1, i, true));
+  }
+  
+  // Render upcoming events list (only future ones, next 10)
   const list = document.getElementById('eventsList');
   list.innerHTML = '';
-  const events = Object.values(state.events).sort((a,b) => {
-    const ad = a.date + (a.time || '00:00');
-    const bd = b.date + (b.time || '00:00');
-    return ad.localeCompare(bd);
-  });
+  const now = new Date();
+  const futureEvents = Object.values(state.events)
+    .filter(e => new Date(e.date + 'T' + (e.time || '23:59')) >= now)
+    .sort((a,b) => {
+      const ad = a.date + (a.time || '00:00');
+      const bd = b.date + (b.time || '00:00');
+      return ad.localeCompare(bd);
+    })
+    .slice(0, 10);
   
-  if (!events.length) {
-    list.innerHTML = '<div class="empty"><div class="empty-icon">📅</div><div class="empty-title">Sin eventos</div><div class="empty-desc">Pulsa "+ Nuevo evento" para añadir uno</div></div>';
+  if (!futureEvents.length) {
+    list.innerHTML = '<div class="empty" style="padding:24px 12px;"><div class="empty-icon">📅</div><div class="empty-desc">Sin eventos próximos</div></div>';
     return;
   }
   
-  const now = new Date();
-  const futureEvents = events.filter(e => new Date(e.date + 'T' + (e.time || '23:59')) >= now);
-  const pastEvents = events.filter(e => new Date(e.date + 'T' + (e.time || '23:59')) < now).reverse();
+  futureEvents.forEach(ev => list.appendChild(buildEventEl(ev)));
+}
+
+function buildEventDayCell(year, month, day, otherMonth) {
+  const date = new Date(year, month, day);
+  const dateKey = formatDate(date);
+  const cell = document.createElement('div');
+  cell.className = 'cal-day';
+  if (otherMonth) cell.classList.add('other-month');
+  const weekday = date.getDay();
+  if (weekday === 0 || weekday === 6) cell.classList.add('weekend');
   
-  if (futureEvents.length) {
-    const h = document.createElement('div');
-    h.innerHTML = '<div class="section-title" style="margin-bottom:8px;">Próximos</div>';
-    list.appendChild(h);
-    futureEvents.forEach(ev => list.appendChild(buildEventEl(ev)));
+  const today = new Date();
+  if (date.toDateString() === today.toDateString()) cell.classList.add('today');
+  
+  const num = document.createElement('div');
+  num.className = 'cal-day-num';
+  num.textContent = day;
+  cell.appendChild(num);
+  
+  // Get events for this day
+  const dayEvents = Object.values(state.events).filter(e => e.date === dateKey);
+  
+  if (dayEvents.length) {
+    // Show event title(s) inside the cell
+    const evWrap = document.createElement('div');
+    evWrap.style.cssText = 'width:100%;margin-top:3px;display:flex;flex-direction:column;gap:2px;align-items:stretch;overflow:hidden;';
+    dayEvents.slice(0, 2).forEach(ev => {
+      const evChip = document.createElement('div');
+      evChip.style.cssText = 'background:var(--info);color:#fff;font-size:9px;font-weight:600;padding:2px 4px;border-radius:4px;text-align:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;line-height:1.2;';
+      evChip.textContent = ev.title;
+      evWrap.appendChild(evChip);
+    });
+    if (dayEvents.length > 2) {
+      const more = document.createElement('div');
+      more.style.cssText = 'font-size:9px;color:var(--text-dim);text-align:center;font-weight:600;';
+      more.textContent = `+${dayEvents.length - 2}`;
+      evWrap.appendChild(more);
+    }
+    cell.appendChild(evWrap);
   }
-  if (pastEvents.length) {
-    const h = document.createElement('div');
-    h.innerHTML = '<div class="section-title" style="margin-top:16px;margin-bottom:8px;">Pasados</div>';
-    list.appendChild(h);
-    pastEvents.slice(0, 10).forEach(ev => list.appendChild(buildEventEl(ev, true)));
+  
+  cell.onclick = () => openEventDaySheet(date);
+  return cell;
+}
+
+function changeEventMonth(delta) {
+  state.evViewMonth += delta;
+  if (state.evViewMonth < 0) { state.evViewMonth = 11; state.evViewYear--; }
+  else if (state.evViewMonth > 11) { state.evViewMonth = 0; state.evViewYear++; }
+  renderEvents();
+}
+
+function goToEventToday() {
+  const t = new Date();
+  state.evViewYear = t.getFullYear();
+  state.evViewMonth = t.getMonth();
+  renderEvents();
+}
+
+function openEventDaySheet(date) {
+  state.evSelectedDate = date;
+  const dateKey = formatDate(date);
+  const dayEvents = Object.values(state.events).filter(e => e.date === dateKey);
+  
+  document.getElementById('daySheetTitle').textContent = date.toLocaleDateString('es-ES', { weekday: 'long', day: 'numeric', month: 'long' });
+  document.getElementById('daySheetSubtitle').textContent = date.getFullYear();
+  
+  const body = document.getElementById('daySheetBody');
+  let evListHtml = '';
+  if (dayEvents.length) {
+    evListHtml = dayEvents.map(ev => `
+      <div class="event-item" onclick="closeDaySheet();setTimeout(()=>openEventEditor('${ev.id}'),100);">
+        <div class="event-item-title">${escapeHtml(ev.title)}</div>
+        ${ev.time ? `<div class="event-item-time">⏰ ${ev.time}</div>` : ''}
+        ${ev.description ? `<div class="event-item-desc">${escapeHtml(ev.description)}</div>` : ''}
+        ${ev.notifyMinutes != null ? `<div class="event-item-desc">🔔 Aviso ${formatNotifyTime(ev.notifyMinutes)}</div>` : ''}
+      </div>
+    `).join('');
+  } else {
+    evListHtml = '<div class="muted" style="font-size:13px;text-align:center;padding:8px 0;">Sin eventos en este día</div>';
   }
+  
+  body.innerHTML = `
+    <div class="section">
+      <div class="section-title">Eventos</div>
+      ${evListHtml}
+    </div>
+    <button class="btn btn-block" onclick="closeDaySheet();setTimeout(()=>openEventEditor(null, '${dateKey}'),100);">+ Añadir evento</button>
+    <button class="btn btn-secondary btn-block mt-12" onclick="closeDaySheet()">Cerrar</button>
+  `;
+  
+  document.getElementById('dayOverlay').classList.add('active');
+  document.getElementById('daySheet').classList.add('active');
 }
 
 function buildEventEl(ev, past) {
