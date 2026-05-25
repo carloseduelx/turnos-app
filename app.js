@@ -2335,4 +2335,560 @@ function renderVacations() {
 }
 
 function openVacationsConfig() {
-  const user = state.users[s
+  const user = state.users[state.currentUser];
+  const v = user.vacations;
+  openModal('Días anuales', `
+    <label class="input-label">Días de vacaciones al año</label>
+    <input type="number" class="input-field" id="vacTotal" value="${v.totalPerYear}" min="0" max="365">
+    <label class="input-label mt-12">Días de libre disposición (LD) al año</label>
+    <input type="number" class="input-field" id="vacLD" value="${v.ldPerYear}" min="0" max="365">
+  `, [
+    { text: 'Cancelar', class: 'btn-secondary', onClick: closeModal },
+    { text: 'Guardar', onClick: () => {
+      user.vacations.totalPerYear = parseInt(document.getElementById('vacTotal').value) || 0;
+      user.vacations.ldPerYear = parseInt(document.getElementById('vacLD').value) || 0;
+      saveUser(state.currentUser);
+      closeModal();
+      renderVacations();
+      toast('Guardado', 'success');
+    }}
+  ]);
+}
+
+// ==========================================================================
+// SETTINGS / MORE MENU
+// ==========================================================================
+function openMoreMenu() {
+  openModal('Más opciones', `
+    <div class="settings-section" style="margin:0;">
+      <div class="settings-row" onclick="closeModal();switchPage('tenure', null, true)">
+        <div>
+          <div class="settings-row-title">⏳ Antigüedad</div>
+          <div class="settings-row-desc">Tiempo en empresa, trienios</div>
+        </div>
+        <div class="settings-row-value">›</div>
+      </div>
+      <div class="settings-row" onclick="closeModal();switchPage('vacations', null, true)">
+        <div>
+          <div class="settings-row-title">🏖️ Vacaciones y libres</div>
+          <div class="settings-row-desc">Control de días disponibles</div>
+        </div>
+        <div class="settings-row-value">›</div>
+      </div>
+      <div class="settings-row" onclick="closeModal();openShiftEditor()">
+        <div>
+          <div class="settings-row-title">🎨 Tipos de turno</div>
+          <div class="settings-row-desc">Personalizar turnos</div>
+        </div>
+        <div class="settings-row-value">›</div>
+      </div>
+      <div class="settings-row" onclick="closeModal();openSettings()">
+        <div>
+          <div class="settings-row-title">⚙️ Ajustes</div>
+          <div class="settings-row-desc">Tema, notificaciones, datos</div>
+        </div>
+        <div class="settings-row-value">›</div>
+      </div>
+    </div>
+  `, [{ text: 'Cerrar', class: 'btn-secondary', onClick: closeModal }]);
+}
+
+function openSettings() {
+  const currentTheme = localStorage.getItem(STORAGE_KEY_THEME) || 'dark';
+  const notifTime = localStorage.getItem(STORAGE_KEY_NOTIF_TIME) || '20:00';
+  const notifEnabled = ('Notification' in window) && Notification.permission === 'granted';
+  const pinEnabled = state.appConfig?.pinEnabled && state.appConfig?.pinHash;
+  
+  openModal('Ajustes', `
+    <div class="settings-section" style="margin:0 0 12px;">
+      <div class="settings-row" onclick="toggleTheme()">
+        <div>
+          <div class="settings-row-title">🌙 Tema</div>
+          <div class="settings-row-desc">Modo oscuro / claro</div>
+        </div>
+        <div class="settings-row-value">${currentTheme === 'dark' ? 'Oscuro' : 'Claro'}</div>
+      </div>
+    </div>
+    
+    <div class="settings-section" style="margin:0 0 12px;">
+      <div class="settings-row" onclick="${pinEnabled ? 'changePin()' : 'setupPin()'}">
+        <div>
+          <div class="settings-row-title">🔒 PIN de bloqueo</div>
+          <div class="settings-row-desc">${pinEnabled ? 'Activado · pulsa para cambiar' : 'Pulsa para activar'}</div>
+        </div>
+        <div class="settings-row-value">›</div>
+      </div>
+      ${pinEnabled ? `
+      <div class="settings-row" onclick="disablePin()">
+        <div><div class="settings-row-title">Desactivar PIN</div></div>
+      </div>
+      <div class="settings-row" onclick="lockNow()">
+        <div><div class="settings-row-title">🔐 Bloquear ahora</div><div class="settings-row-desc">Pedir PIN inmediatamente</div></div>
+      </div>` : ''}
+    </div>
+    
+    <div class="settings-section" style="margin:0 0 12px;">
+      <div class="settings-row">
+        <div>
+          <div class="settings-row-title">🔔 Notificaciones</div>
+          <div class="settings-row-desc">${notifEnabled ? 'Activadas' : 'Pulsa para activar'}</div>
+        </div>
+        <div class="toggle ${notifEnabled ? 'on' : ''}" onclick="requestNotificationPermission()"></div>
+      </div>
+      <div class="settings-row">
+        <div>
+          <div class="settings-row-title">⏰ Hora aviso del turno</div>
+          <div class="settings-row-desc">Recordatorio del día siguiente</div>
+        </div>
+        <input type="time" id="notifTimeInput" value="${notifTime}" style="background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:6px;color:var(--text);font-family:inherit;" onchange="setNotifTime(this.value)">
+      </div>
+    </div>
+    
+    <div class="settings-section" style="margin:0 0 12px;">
+      <div class="settings-row" onclick="closeModal();openShiftEditor()">
+        <div><div class="settings-row-title">🎨 Tipos de turno</div></div>
+        <div class="settings-row-value">›</div>
+      </div>
+      <div class="settings-row" onclick="exportAllData()">
+        <div><div class="settings-row-title">📤 Exportar todos los datos (JSON)</div></div>
+        <div class="settings-row-value">›</div>
+      </div>
+      <div class="settings-row" onclick="importDataPrompt()">
+        <div><div class="settings-row-title">📥 Importar datos</div></div>
+        <div class="settings-row-value">›</div>
+      </div>
+    </div>
+    
+    <div class="settings-section" style="margin:0;">
+      <div class="settings-row" onclick="changeFirebaseConfig()">
+        <div>
+          <div class="settings-row-title">☁️ Configuración Firebase</div>
+          <div class="settings-row-desc">${firebaseConnected ? 'Conectado' : 'Sin conexión'}</div>
+        </div>
+        <div class="settings-row-value">›</div>
+      </div>
+      <div class="settings-row" onclick="resetAllData()">
+        <div>
+          <div class="settings-row-title" style="color:var(--danger);">🗑️ Borrar todos los datos</div>
+        </div>
+      </div>
+    </div>
+  `, [{ text: 'Cerrar', class: 'btn-secondary', onClick: closeModal }]);
+}
+
+function toggleTheme() {
+  const cur = localStorage.getItem(STORAGE_KEY_THEME) || 'dark';
+  const next = cur === 'dark' ? 'light' : 'dark';
+  applyTheme(next);
+  localStorage.setItem(STORAGE_KEY_THEME, next);
+  closeModal();
+  setTimeout(openSettings, 100);
+}
+
+function applyTheme(theme) {
+  document.documentElement.setAttribute('data-theme', theme);
+  document.querySelector('meta[name="theme-color"]').content = theme === 'dark' ? '#0a0f0e' : '#f5f7f6';
+}
+
+function setNotifTime(time) {
+  localStorage.setItem(STORAGE_KEY_NOTIF_TIME, time);
+  scheduleNotifications();
+  toast('Hora actualizada', 'success');
+}
+
+function changeFirebaseConfig() {
+  if (confirm('¿Cambiar la configuración de Firebase?\n\nNota: se recargará la app.')) {
+    localStorage.removeItem(STORAGE_KEY_CONFIG);
+    location.reload();
+  }
+}
+
+function resetAllData() {
+  if (!confirm('¿Borrar TODOS los datos? Esta acción no se puede deshacer.')) return;
+  if (!confirm('¿Estás seguro? Se eliminarán turnos, nóminas, eventos y configuración.')) return;
+  localStorage.clear();
+  if (firebaseConnected) {
+    firebase.remove(firebase.ref(firebaseDb)).catch(()=>{});
+  }
+  location.reload();
+}
+
+function exportAllData() {
+  const data = { users: state.users, events: state.events, appConfig: state.appConfig, exportedAt: new Date().toISOString() };
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `turnos-backup-${formatDate(new Date())}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+  toast('Datos exportados', 'success');
+}
+
+function importDataPrompt() {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = 'application/json';
+  input.onchange = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const data = JSON.parse(text);
+      if (!data.users && !data.events) { toast('Formato no válido', 'error'); return; }
+      if (!confirm('¿Sobrescribir los datos actuales con la copia de seguridad?')) return;
+      mergeStateData(data);
+      saveUser('user1');
+      saveUser('user2');
+      saveEvents();
+      renderAll();
+      closeModal();
+      toast('Datos importados', 'success');
+    } catch (err) {
+      toast('Error: ' + err.message, 'error');
+    }
+  };
+  input.click();
+}
+
+// ==========================================================================
+// EXPORT
+// ==========================================================================
+function exportStatsPDF() {
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF();
+  const user = state.users[state.currentUser];
+  const isMonth = state.statsMode === 'month';
+  const period = isMonth ? `${MONTHS[state.statsMonth]} ${state.statsYear}` : `${state.statsYear}`;
+  
+  doc.setFontSize(20);
+  doc.text(`Turnos · ${user.name}`, 14, 20);
+  doc.setFontSize(14);
+  doc.text(`Periodo: ${period}`, 14, 30);
+  
+  // Compute stats
+  const counts = {};
+  let totalDays = 0, totalHours = 0;
+  for (const [key, val] of Object.entries(user.days)) {
+    const shifts = getDayShifts(val);
+    if (!shifts.length) continue;
+    const d = new Date(key + 'T00:00:00');
+    if (isMonth) {
+      if (d.getFullYear() !== state.statsYear || d.getMonth() !== state.statsMonth) continue;
+    } else {
+      if (d.getFullYear() !== state.statsYear) continue;
+    }
+    let dayHasWork = false;
+    for (const ds of shifts) {
+      counts[ds.shiftId] = counts[ds.shiftId] || { days: 0, hours: 0 };
+      counts[ds.shiftId].days++;
+      counts[ds.shiftId].hours += ds.hours || 0;
+      totalHours += ds.hours || 0;
+      dayHasWork = true;
+    }
+    if (dayHasWork) totalDays++;
+  }
+  
+  doc.setFontSize(11);
+  doc.text(`Total días con turno: ${totalDays}`, 14, 42);
+  doc.text(`Total horas: ${totalHours.toFixed(1)}`, 14, 49);
+  
+  let y = 60;
+  doc.setFontSize(12);
+  doc.text('Desglose por turno:', 14, y); y += 8;
+  doc.setFontSize(10);
+  user.shifts.forEach(s => {
+    const c = counts[s.id]; if (!c) return;
+    doc.text(`${s.code} · ${s.name}: ${c.days} días · ${c.hours.toFixed(1)}h`, 14, y); y += 6;
+  });
+  
+  doc.save(`turnos-${user.name}-${period}.pdf`);
+  toast('PDF generado', 'success');
+}
+
+function exportStatsExcel() {
+  const user = state.users[state.currentUser];
+  const isMonth = state.statsMode === 'month';
+  const period = isMonth ? `${MONTHS[state.statsMonth]}_${state.statsYear}` : `${state.statsYear}`;
+  
+  const rows = [['Fecha', 'Día semana', 'Turnos', 'Horas total', 'Nota']];
+  const days = Object.entries(user.days).sort();
+  for (const [key, val] of days) {
+    const shifts = getDayShifts(val);
+    if (!shifts.length) continue;
+    const d = new Date(key + 'T00:00:00');
+    if (isMonth) {
+      if (d.getFullYear() !== state.statsYear || d.getMonth() !== state.statsMonth) continue;
+    } else {
+      if (d.getFullYear() !== state.statsYear) continue;
+    }
+    const shiftLabels = shifts.map(ds => {
+      const sh = user.shifts.find(s => s.id === ds.shiftId);
+      return sh ? `${sh.code} (${ds.hours}h)` : '';
+    }).filter(Boolean).join(' + ');
+    const totalH = shifts.reduce((sum, ds) => sum + (ds.hours || 0), 0);
+    rows.push([
+      key,
+      d.toLocaleDateString('es-ES', { weekday: 'long' }),
+      shiftLabels,
+      totalH,
+      user.notes[key] || ''
+    ]);
+  }
+  
+  const ws = XLSX.utils.aoa_to_sheet(rows);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Turnos');
+  
+  // Add summary sheet
+  const sumRows = [['Turno', 'Nombre', 'Días', 'Horas']];
+  const counts = {};
+  for (const [key, val] of Object.entries(user.days)) {
+    const shifts = getDayShifts(val);
+    if (!shifts.length) continue;
+    const d = new Date(key + 'T00:00:00');
+    if (isMonth) {
+      if (d.getFullYear() !== state.statsYear || d.getMonth() !== state.statsMonth) continue;
+    } else {
+      if (d.getFullYear() !== state.statsYear) continue;
+    }
+    for (const ds of shifts) {
+      counts[ds.shiftId] = counts[ds.shiftId] || { days: 0, hours: 0 };
+      counts[ds.shiftId].days++;
+      counts[ds.shiftId].hours += ds.hours || 0;
+    }
+  }
+  user.shifts.forEach(s => {
+    const c = counts[s.id];
+    if (c) sumRows.push([s.code, s.name, c.days, c.hours]);
+  });
+  
+  const ws2 = XLSX.utils.aoa_to_sheet(sumRows);
+  XLSX.utils.book_append_sheet(wb, ws2, 'Resumen');
+  
+  // Payrolls sheet
+  const payRows = [['Año', 'Mes', 'Etiqueta', 'Bruto', 'Neto', 'Retenido']];
+  Object.values(user.payrolls || {}).sort((a,b) => (a.year-b.year)||(a.month-b.month)).forEach(p => {
+    payRows.push([p.year, MONTHS[p.month], p.label || '', p.gross, p.net, p.withheld]);
+  });
+  if (payRows.length > 1) {
+    const ws3 = XLSX.utils.aoa_to_sheet(payRows);
+    XLSX.utils.book_append_sheet(wb, ws3, 'Nóminas');
+  }
+  
+  XLSX.writeFile(wb, `turnos-${user.name}-${period}.xlsx`);
+  toast('Excel generado', 'success');
+}
+
+// ==========================================================================
+// NOTIFICATIONS
+// ==========================================================================
+function checkNotificationPermission() {
+  if (!('Notification' in window)) return;
+  // Don't auto-prompt; user can toggle from settings
+}
+
+async function requestNotificationPermission() {
+  if (!('Notification' in window)) { toast('Tu navegador no soporta notificaciones', 'error'); return; }
+  const perm = await Notification.requestPermission();
+  if (perm === 'granted') {
+    toast('Notificaciones activadas', 'success');
+    scheduleNotifications();
+  } else {
+    toast('Notificaciones rechazadas', 'error');
+  }
+  closeModal();
+  setTimeout(openSettings, 100);
+}
+
+let notificationTimers = [];
+
+function scheduleNotifications() {
+  // Clear existing
+  notificationTimers.forEach(t => clearTimeout(t));
+  notificationTimers = [];
+  
+  if (!('Notification' in window) || Notification.permission !== 'granted') return;
+  
+  const now = Date.now();
+  const notifTime = localStorage.getItem(STORAGE_KEY_NOTIF_TIME) || '20:00';
+  const [h, m] = notifTime.split(':').map(Number);
+  
+  // Schedule shift notifications for next 14 days
+  for (let i = 0; i < 14; i++) {
+    const d = new Date();
+    d.setDate(d.getDate() + i);
+    d.setHours(h, m, 0, 0);
+    if (d.getTime() <= now) continue;
+    
+    const tomorrowDate = new Date(d);
+    tomorrowDate.setDate(d.getDate() + 1);
+    const key = formatDate(tomorrowDate);
+    
+    const delay = d.getTime() - now;
+    if (delay > 0 && delay < 2147483647) {
+      const t = setTimeout(() => {
+        const user = state.users[state.currentUser];
+        const dayData = user.days[key];
+        if (dayData?.shiftId) {
+          const shift = user.shifts.find(s => s.id === dayData.shiftId);
+          if (shift) {
+            new Notification('Turno mañana', { body: `${shift.code} - ${shift.name} (${dayData.hours}h)`, tag: `shift-${key}` });
+          }
+        }
+      }, delay);
+      notificationTimers.push(t);
+    }
+  }
+  
+  // Schedule event notifications
+  Object.values(state.events).forEach(ev => {
+    if (ev.notifyMinutes == null) return;
+    const evTime = ev.time || '09:00';
+    const evDate = new Date(ev.date + 'T' + evTime);
+    const notifyAt = evDate.getTime() - ev.notifyMinutes * 60 * 1000;
+    const delay = notifyAt - now;
+    if (delay > 0 && delay < 2147483647) {
+      const t = setTimeout(() => {
+        new Notification(ev.title, { body: `${ev.date}${ev.time ? ' a las ' + ev.time : ''}${ev.description ? '\n' + ev.description : ''}`, tag: `event-${ev.id}` });
+      }, delay);
+      notificationTimers.push(t);
+    }
+  });
+}
+
+// ==========================================================================
+// PAGE SWITCHING
+// ==========================================================================
+let currentPage = 'calendar';
+
+function switchPage(page, btnEl, fromMore) {
+  currentPage = page;
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  const target = document.getElementById('page-' + page);
+  if (target) target.classList.add('active');
+  
+  if (btnEl) {
+    document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+    btnEl.classList.add('active');
+  } else if (fromMore) {
+    // came from more menu - keep "more" highlighted or unhighlight all
+    document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  }
+  
+  // Render
+  if (page === 'calendar') renderCalendar();
+  else if (page === 'events') renderEvents();
+  else if (page === 'stats') renderStats();
+  else if (page === 'payroll') renderPayrolls();
+  else if (page === 'tenure') renderTenure();
+  else if (page === 'vacations') renderVacations();
+  
+  document.getElementById('main').scrollTop = 0;
+}
+
+function renderAll() {
+  renderUserTabs();
+  if (currentPage === 'calendar') renderCalendar();
+  else if (currentPage === 'events') renderEvents();
+  else if (currentPage === 'stats') renderStats();
+  else if (currentPage === 'payroll') renderPayrolls();
+  else if (currentPage === 'tenure') renderTenure();
+  else if (currentPage === 'vacations') renderVacations();
+}
+
+// ==========================================================================
+// MODAL
+// ==========================================================================
+function openModal(title, bodyHtml, buttons) {
+  document.getElementById('modalTitle').textContent = title;
+  document.getElementById('modalBody').innerHTML = bodyHtml;
+  const footer = document.getElementById('modalFooter');
+  footer.innerHTML = '';
+  (buttons || []).forEach(b => {
+    const btn = document.createElement('button');
+    btn.className = 'btn ' + (b.class || '');
+    btn.textContent = b.text;
+    btn.onclick = b.onClick;
+    footer.appendChild(btn);
+  });
+  document.getElementById('modalOverlay').classList.add('active');
+}
+
+function closeModal() {
+  document.getElementById('modalOverlay').classList.remove('active');
+}
+
+document.getElementById('modalOverlay').addEventListener('click', (e) => {
+  if (e.target.id === 'modalOverlay') closeModal();
+});
+
+// ==========================================================================
+// TOAST
+// ==========================================================================
+let toastTimer;
+function toast(msg, type) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'toast show ' + (type || '');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), 2800);
+}
+
+// ==========================================================================
+// HELPERS
+// ==========================================================================
+function formatDate(d) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function escapeHtml(s) {
+  if (s == null) return '';
+  return String(s).replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]);
+}
+
+function isColorDark(hex) {
+  if (!hex) return false;
+  const c = hex.replace('#','');
+  const r = parseInt(c.substring(0,2), 16);
+  const g = parseInt(c.substring(2,4), 16);
+  const b = parseInt(c.substring(4,6), 16);
+  const yiq = (r*299 + g*587 + b*114) / 1000;
+  return yiq < 140;
+}
+
+function getCss(varName) {
+  return getComputedStyle(document.documentElement).getPropertyValue(varName).trim();
+}
+
+function formatMoney(n) {
+  const v = parseFloat(n) || 0;
+  return v.toLocaleString('es-ES', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' €';
+}
+
+function addMonths(d, n) {
+  const r = new Date(d);
+  r.setMonth(r.getMonth() + n);
+  return r;
+}
+
+function formatNotifyTime(min) {
+  if (min === 0) return 'a la hora del evento';
+  if (min < 60) return `${min} min antes`;
+  if (min < 1440) return `${min/60} h antes`;
+  if (min === 1440) return '1 día antes';
+  if (min < 10080) return `${min/1440} días antes`;
+  return `${Math.round(min/10080)} semana${min/10080>1?'s':''} antes`;
+}
+
+// ==========================================================================
+// SERVICE WORKER REGISTRATION (PWA)
+// ==========================================================================
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('sw.js').catch(err => console.log('SW reg failed:', err));
+  });
+}
