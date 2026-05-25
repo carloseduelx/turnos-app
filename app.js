@@ -24,16 +24,24 @@ const STORAGE_KEY_LOCAL = 'turnos-local-data';
 const STORAGE_KEY_LAST_USER = 'turnos-last-user';
 const STORAGE_KEY_THEME = 'turnos-theme';
 const STORAGE_KEY_NOTIF_TIME = 'turnos-notif-time';
+const STORAGE_KEY_PIN_SESSION = 'turnos-pin-session';
+const STORAGE_KEY_PIN_FAILS = 'turnos-pin-fails';
+const STORAGE_KEY_PIN_LOCKED_UNTIL = 'turnos-pin-locked-until';
+
+const PIN_MAX_FAILS = 5;
+const PIN_LOCK_MINUTES = 5;
+const PIN_SESSION_MINUTES = 60 * 12; // re-pedir PIN tras 12h de inactividad
 
 // ==========================================================================
 // State
 // ==========================================================================
 let state = {
   users: {
-    user1: { name: 'Persona 1', shifts: [...DEFAULT_SHIFTS], days: {}, notes: {}, payrolls: {}, tenure: { startDate: null, manualDaysBefore: 0, monthlyChecks: {} }, vacations: { totalPerYear: 22, ldPerYear: 0 } },
-    user2: { name: 'Persona 2', shifts: [...DEFAULT_SHIFTS], days: {}, notes: {}, payrolls: {}, tenure: { startDate: null, manualDaysBefore: 0, monthlyChecks: {} }, vacations: { totalPerYear: 22, ldPerYear: 0 } },
+    user1: { name: 'Persona 1', shifts: [...DEFAULT_SHIFTS], days: {}, notes: {}, payrolls: {}, tenure: { startDate: null, manualDaysBefore: 0, periods: [], monthlyChecks: {} }, vacations: { totalPerYear: 22, ldPerYear: 0 } },
+    user2: { name: 'Persona 2', shifts: [...DEFAULT_SHIFTS], days: {}, notes: {}, payrolls: {}, tenure: { startDate: null, manualDaysBefore: 0, periods: [], monthlyChecks: {} }, vacations: { totalPerYear: 22, ldPerYear: 0 } },
   },
-  events: {}, // shared events: events[id] = { id, date, time, title, description, notifyMinutes }
+  events: {}, // shared events
+  appConfig: { pinHash: null, pinEnabled: false }, // shared app config
   currentUser: 'user1',
   viewYear: new Date().getFullYear(),
   viewMonth: new Date().getMonth(),
@@ -93,9 +101,37 @@ function tryConnectFirebase() {
     firebaseDb = firebase.getDatabase(firebaseApp);
     try { firebaseStorage = firebase.getStorage(firebaseApp); } catch(e) { console.warn('Storage not available', e); }
     firebaseConnected = true;
-    setupFirebaseSync();
-    showApp();
-    updateSyncDot(true);
+    
+    // Fetch initial appConfig BEFORE showing app, so we know if PIN is needed
+    firebase.get(firebase.ref(firebaseDb, 'appConfig')).then(snap => {
+      const val = snap.val();
+      if (val) state.appConfig = { ...state.appConfig, ...val };
+      // Also fetch users first to have them ready
+      return Promise.all([
+        firebase.get(firebase.ref(firebaseDb, 'users/user1')),
+        firebase.get(firebase.ref(firebaseDb, 'users/user2')),
+        firebase.get(firebase.ref(firebaseDb, 'events'))
+      ]);
+    }).then(([u1, u2, ev]) => {
+      if (u1.val()) state.users.user1 = { ...state.users.user1, ...u1.val() };
+      if (u2.val()) state.users.user2 = { ...state.users.user2, ...u2.val() };
+      if (ev.val()) state.events = ev.val();
+      // Ensure structure
+      for (const uid of ['user1','user2']) {
+        if (!state.users[uid].shifts || !state.users[uid].shifts.length) state.users[uid].shifts = [...DEFAULT_SHIFTS];
+        if (!state.users[uid].tenure) state.users[uid].tenure = { startDate: null, manualDaysBefore: 0, periods: [], monthlyChecks: {} };
+        if (!state.users[uid].tenure.periods) state.users[uid].tenure.periods = [];
+        normalizeDays(state.users[uid]);
+      }
+      setupFirebaseSync();
+      showApp();
+      updateSyncDot(true);
+    }).catch(err => {
+      console.error('Initial fetch error', err);
+      setupFirebaseSync();
+      showApp();
+      updateSyncDot(true);
+    });
   } catch (err) {
     console.error('Firebase connect error', err);
     toast('Error conectando a Firebase: ' + err.message, 'error');
@@ -123,6 +159,28 @@ function skipFirebase() {
 
 function showApp() {
   document.getElementById('setupScreen').style.display = 'none';
+  
+  // Check PIN before showing app
+  if (state.appConfig?.pinEnabled && state.appConfig?.pinHash) {
+    // Check if there's a valid session
+    const session = localStorage.getItem(STORAGE_KEY_PIN_SESSION);
+    if (session) {
+      const sessionTs = parseInt(session);
+      if (Date.now() - sessionTs < PIN_SESSION_MINUTES * 60 * 1000) {
+        // Valid session, skip PIN
+        showAppContent();
+        return;
+      }
+    }
+    showPinScreen();
+    return;
+  }
+  
+  showAppContent();
+}
+
+function showAppContent() {
+  document.getElementById('pinScreen').style.display = 'none';
   document.getElementById('header').style.display = 'flex';
   document.getElementById('userTabs').style.display = 'flex';
   document.getElementById('main').style.display = 'block';
@@ -133,6 +191,270 @@ function showApp() {
   
   renderUserTabs();
   renderCalendar();
+}
+
+// ==========================================================================
+// PIN (lock screen)
+// ==========================================================================
+async function sha256(str) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function showPinScreen() {
+  document.getElementById('setupScreen').style.display = 'none';
+  document.getElementById('header').style.display = 'none';
+  document.getElementById('userTabs').style.display = 'none';
+  document.getElementById('main').style.display = 'none';
+  document.getElementById('navBottom').style.display = 'none';
+  
+  const pinScreen = document.getElementById('pinScreen');
+  pinScreen.style.display = 'flex';
+  
+  const lockedUntil = parseInt(localStorage.getItem(STORAGE_KEY_PIN_LOCKED_UNTIL) || '0');
+  const now = Date.now();
+  
+  if (lockedUntil > now) {
+    renderPinLocked(lockedUntil);
+    return;
+  }
+  
+  renderPinPad();
+}
+
+function renderPinPad() {
+  const pinScreen = document.getElementById('pinScreen');
+  const fails = parseInt(localStorage.getItem(STORAGE_KEY_PIN_FAILS) || '0');
+  const remaining = PIN_MAX_FAILS - fails;
+  
+  pinScreen.innerHTML = `
+    <div style="text-align:center;margin-bottom:24px;">
+      <div style="width:64px;height:64px;background:linear-gradient(135deg,var(--accent),var(--accent-2));border-radius:18px;display:inline-flex;align-items:center;justify-content:center;font-size:32px;margin-bottom:16px;box-shadow:0 8px 32px var(--accent-glow);">🔒</div>
+      <h1 style="margin:0 0 4px;font-size:24px;font-weight:700;">Introduce el PIN</h1>
+      <p style="color:var(--text-dim);margin:0;font-size:13px;">${fails > 0 ? `${remaining} intento${remaining===1?'':'s'} restante${remaining===1?'':'s'}` : ''}</p>
+    </div>
+    <div id="pinDots" style="display:flex;gap:12px;margin-bottom:32px;"></div>
+    <div id="pinPad" style="display:grid;grid-template-columns:repeat(3,1fr);gap:14px;width:280px;"></div>
+    <div id="pinError" style="color:var(--danger);font-size:13px;margin-top:14px;height:18px;font-weight:500;"></div>
+  `;
+  
+  window._pinEntry = '';
+  window._pinLength = 0;
+  renderPinDots();
+  renderPinButtons();
+}
+
+function renderPinDots() {
+  const dotsEl = document.getElementById('pinDots');
+  if (!dotsEl) return;
+  // Show 4-6 dots dynamically based on entry length, max we visualize 6
+  const visualLen = Math.max(4, Math.min(6, window._pinEntry.length || 4));
+  const entryLen = window._pinEntry.length;
+  let html = '';
+  for (let i = 0; i < Math.max(visualLen, entryLen); i++) {
+    const filled = i < entryLen;
+    html += `<div style="width:18px;height:18px;border-radius:50%;border:2px solid var(--accent);background:${filled ? 'var(--accent)' : 'transparent'};transition:all 0.15s;"></div>`;
+  }
+  dotsEl.innerHTML = html;
+}
+
+function renderPinButtons() {
+  const padEl = document.getElementById('pinPad');
+  if (!padEl) return;
+  const layout = ['1','2','3','4','5','6','7','8','9','','0','⌫'];
+  padEl.innerHTML = layout.map(key => {
+    if (!key) return '<div></div>';
+    if (key === '⌫') {
+      return `<button onclick="pinDelete()" style="height:68px;background:transparent;border:none;color:var(--text);font-size:22px;cursor:pointer;border-radius:50%;">⌫</button>`;
+    }
+    return `<button onclick="pinPress('${key}')" style="height:68px;background:var(--panel);border:1px solid var(--border);color:var(--text);font-size:26px;font-weight:600;cursor:pointer;border-radius:50%;transition:transform 0.1s;font-family:'JetBrains Mono',monospace;" ontouchstart="this.style.transform='scale(0.92)';this.style.background='var(--panel-2)'" ontouchend="this.style.transform='';this.style.background='var(--panel)'">${key}</button>`;
+  }).join('');
+  
+  // Add a "submit" hint area or use enter on 4+ digits
+  // We auto-validate on 4-8 digits but require explicit submit only if pinSubmitMode
+  // Let's auto-validate when length >= configured length (we save the length when set)
+}
+
+async function pinPress(digit) {
+  if (window._pinEntry.length >= 8) return;
+  window._pinEntry += digit;
+  renderPinDots();
+  
+  // Auto-validate when length matches saved length
+  const savedLen = state.appConfig?.pinLength || 4;
+  if (window._pinEntry.length === savedLen) {
+    setTimeout(() => validatePin(), 150);
+  }
+}
+
+function pinDelete() {
+  window._pinEntry = window._pinEntry.slice(0, -1);
+  renderPinDots();
+}
+
+async function validatePin() {
+  const entered = window._pinEntry;
+  const hash = await sha256(entered);
+  const expected = state.appConfig?.pinHash;
+  
+  if (hash === expected) {
+    // Success
+    localStorage.setItem(STORAGE_KEY_PIN_SESSION, String(Date.now()));
+    localStorage.removeItem(STORAGE_KEY_PIN_FAILS);
+    localStorage.removeItem(STORAGE_KEY_PIN_LOCKED_UNTIL);
+    document.getElementById('pinScreen').style.display = 'none';
+    showAppContent();
+  } else {
+    // Fail
+    let fails = parseInt(localStorage.getItem(STORAGE_KEY_PIN_FAILS) || '0') + 1;
+    localStorage.setItem(STORAGE_KEY_PIN_FAILS, String(fails));
+    
+    if (fails >= PIN_MAX_FAILS) {
+      const lockedUntil = Date.now() + PIN_LOCK_MINUTES * 60 * 1000;
+      localStorage.setItem(STORAGE_KEY_PIN_LOCKED_UNTIL, String(lockedUntil));
+      renderPinLocked(lockedUntil);
+    } else {
+      // Shake and clear
+      const dotsEl = document.getElementById('pinDots');
+      const errEl = document.getElementById('pinError');
+      if (dotsEl) {
+        dotsEl.style.animation = 'shake 0.4s';
+        setTimeout(() => { dotsEl.style.animation = ''; }, 400);
+      }
+      if (errEl) errEl.textContent = `PIN incorrecto · ${PIN_MAX_FAILS - fails} intento${PIN_MAX_FAILS - fails === 1 ? '' : 's'} restante${PIN_MAX_FAILS - fails === 1 ? '' : 's'}`;
+      window._pinEntry = '';
+      renderPinDots();
+    }
+  }
+}
+
+function renderPinLocked(lockedUntil) {
+  const pinScreen = document.getElementById('pinScreen');
+  pinScreen.innerHTML = `
+    <div style="text-align:center;">
+      <div style="width:64px;height:64px;background:var(--danger);border-radius:18px;display:inline-flex;align-items:center;justify-content:center;font-size:32px;margin-bottom:16px;">⛔</div>
+      <h1 style="margin:0 0 8px;font-size:24px;font-weight:700;">Bloqueado</h1>
+      <p style="color:var(--text-dim);margin:0 0 20px;max-width:280px;">Demasiados intentos fallidos. Espera unos minutos antes de volver a intentarlo.</p>
+      <div id="lockCountdown" style="font-size:48px;font-weight:700;font-family:'JetBrains Mono',monospace;color:var(--danger);"></div>
+    </div>
+  `;
+  
+  const updateCountdown = () => {
+    const remaining = lockedUntil - Date.now();
+    if (remaining <= 0) {
+      localStorage.removeItem(STORAGE_KEY_PIN_LOCKED_UNTIL);
+      localStorage.removeItem(STORAGE_KEY_PIN_FAILS);
+      renderPinPad();
+      return;
+    }
+    const min = Math.floor(remaining / 60000);
+    const sec = Math.floor((remaining % 60000) / 1000);
+    const el = document.getElementById('lockCountdown');
+    if (el) el.textContent = `${String(min).padStart(2,'0')}:${String(sec).padStart(2,'0')}`;
+    setTimeout(updateCountdown, 500);
+  };
+  updateCountdown();
+}
+
+async function setupPin() {
+  const enteredPin = await new Promise(resolve => {
+    openModal('Establecer PIN', `
+      <p class="muted" style="margin-top:0;">Crea un PIN de 4 a 6 dígitos. Se pedirá al abrir la app.</p>
+      <input type="password" inputmode="numeric" pattern="[0-9]*" class="input-field" id="newPinInput" placeholder="Nuevo PIN" maxlength="6" autocomplete="off">
+      <input type="password" inputmode="numeric" pattern="[0-9]*" class="input-field mt-12" id="newPinConfirm" placeholder="Confirma PIN" maxlength="6" autocomplete="off">
+      <div id="pinSetupError" style="color:var(--danger);font-size:13px;margin-top:8px;min-height:18px;"></div>
+    `, [
+      { text: 'Cancelar', class: 'btn-secondary', onClick: () => { resolve(null); closeModal(); } },
+      { text: 'Establecer', onClick: () => {
+        const a = document.getElementById('newPinInput').value;
+        const b = document.getElementById('newPinConfirm').value;
+        const err = document.getElementById('pinSetupError');
+        if (!/^\d{4,6}$/.test(a)) { err.textContent = 'El PIN debe tener entre 4 y 6 dígitos'; return; }
+        if (a !== b) { err.textContent = 'Los PINs no coinciden'; return; }
+        resolve(a);
+        closeModal();
+      }}
+    ]);
+    setTimeout(() => document.getElementById('newPinInput')?.focus(), 100);
+  });
+  
+  if (!enteredPin) return;
+  
+  const hash = await sha256(enteredPin);
+  state.appConfig = state.appConfig || {};
+  state.appConfig.pinHash = hash;
+  state.appConfig.pinEnabled = true;
+  state.appConfig.pinLength = enteredPin.length;
+  saveAppConfig();
+  // Mark current session as valid
+  localStorage.setItem(STORAGE_KEY_PIN_SESSION, String(Date.now()));
+  toast('PIN establecido. Se pedirá en ambos móviles.', 'success');
+}
+
+async function changePin() {
+  // First verify current PIN
+  if (state.appConfig?.pinEnabled && state.appConfig?.pinHash) {
+    const cur = await new Promise(resolve => {
+      openModal('Cambiar PIN', `
+        <p class="muted" style="margin-top:0;">Introduce el PIN actual:</p>
+        <input type="password" inputmode="numeric" pattern="[0-9]*" class="input-field" id="curPinInput" maxlength="6" autocomplete="off">
+        <div id="curPinError" style="color:var(--danger);font-size:13px;margin-top:8px;min-height:18px;"></div>
+      `, [
+        { text: 'Cancelar', class: 'btn-secondary', onClick: () => { resolve(null); closeModal(); } },
+        { text: 'Continuar', onClick: async () => {
+          const val = document.getElementById('curPinInput').value;
+          const h = await sha256(val);
+          if (h === state.appConfig.pinHash) { resolve(val); closeModal(); }
+          else { document.getElementById('curPinError').textContent = 'PIN incorrecto'; }
+        }}
+      ]);
+      setTimeout(() => document.getElementById('curPinInput')?.focus(), 100);
+    });
+    if (!cur) return;
+  }
+  setupPin();
+}
+
+async function disablePin() {
+  if (!confirm('¿Desactivar el PIN? La app dejará de pedirlo al abrirse.')) return;
+  // Verify current PIN first
+  if (state.appConfig?.pinHash) {
+    const cur = prompt('Introduce el PIN actual para confirmar:');
+    if (!cur) return;
+    const h = await sha256(cur);
+    if (h !== state.appConfig.pinHash) {
+      toast('PIN incorrecto', 'error');
+      return;
+    }
+  }
+  state.appConfig.pinEnabled = false;
+  state.appConfig.pinHash = null;
+  state.appConfig.pinLength = null;
+  saveAppConfig();
+  localStorage.removeItem(STORAGE_KEY_PIN_SESSION);
+  localStorage.removeItem(STORAGE_KEY_PIN_FAILS);
+  localStorage.removeItem(STORAGE_KEY_PIN_LOCKED_UNTIL);
+  toast('PIN desactivado', 'success');
+  closeModal();
+  setTimeout(openSettings, 100);
+}
+
+function lockNow() {
+  localStorage.removeItem(STORAGE_KEY_PIN_SESSION);
+  showPinScreen();
+  toast('App bloqueada', 'info');
+  closeModal();
+}
+
+function saveAppConfig() {
+  if (!firebaseConnected) {
+    localStorage.setItem(STORAGE_KEY_LOCAL, JSON.stringify({ users: state.users, events: state.events, appConfig: state.appConfig }));
+    return;
+  }
+  suppressFirebaseWrite = true;
+  firebase.set(firebase.ref(firebaseDb, 'appConfig'), state.appConfig)
+    .then(() => { setTimeout(() => suppressFirebaseWrite = false, 200); })
+    .catch(err => { console.error(err); toast('Error guardando: ' + err.message, 'error'); suppressFirebaseWrite = false; });
 }
 
 function updateSyncDot(connected) {
@@ -160,8 +482,11 @@ function setupFirebaseSync() {
         if (!state.users[uid].days) state.users[uid].days = {};
         if (!state.users[uid].notes) state.users[uid].notes = {};
         if (!state.users[uid].payrolls) state.users[uid].payrolls = {};
-        if (!state.users[uid].tenure) state.users[uid].tenure = { startDate: null, manualDaysBefore: 0, monthlyChecks: {} };
+        if (!state.users[uid].tenure) state.users[uid].tenure = { startDate: null, manualDaysBefore: 0, periods: [], monthlyChecks: {} };
+        if (!state.users[uid].tenure.periods) state.users[uid].tenure.periods = [];
         if (!state.users[uid].vacations) state.users[uid].vacations = { totalPerYear: 22, ldPerYear: 0 };
+        // Normalize days to multi-shift format
+        normalizeDays(state.users[uid]);
         renderAll();
       }
     });
@@ -178,11 +503,43 @@ function setupFirebaseSync() {
       renderCalendar();
     }
   });
+  
+  // Listen to app config (PIN)
+  const cR = firebase.ref(firebaseDb, 'appConfig');
+  firebase.onValue(cR, snap => {
+    const val = snap.val();
+    if (val && !suppressFirebaseWrite) {
+      state.appConfig = { ...state.appConfig, ...val };
+    }
+  });
+}
+
+function normalizeDays(user) {
+  // Convert legacy {shiftId, hours} format to {shifts: [{shiftId, hours}]}
+  if (!user.days) return;
+  for (const key of Object.keys(user.days)) {
+    const d = user.days[key];
+    if (!d) { delete user.days[key]; continue; }
+    if (d.shifts && Array.isArray(d.shifts)) continue; // already new format
+    if (d.shiftId) {
+      user.days[key] = { shifts: [{ shiftId: d.shiftId, hours: d.hours || 0 }] };
+    } else {
+      delete user.days[key];
+    }
+  }
+}
+
+// Helper: get array of {shiftId, hours} for a day, or empty array
+function getDayShifts(dayData) {
+  if (!dayData) return [];
+  if (dayData.shifts && Array.isArray(dayData.shifts)) return dayData.shifts;
+  if (dayData.shiftId) return [{ shiftId: dayData.shiftId, hours: dayData.hours || 0 }];
+  return [];
 }
 
 function saveUser(uid) {
   // Always cache locally
-  localStorage.setItem(STORAGE_KEY_LOCAL, JSON.stringify({ users: state.users, events: state.events }));
+  localStorage.setItem(STORAGE_KEY_LOCAL, JSON.stringify({ users: state.users, events: state.events, appConfig: state.appConfig }));
   if (!firebaseConnected) return;
   suppressFirebaseWrite = true;
   firebase.set(firebase.ref(firebaseDb, `users/${uid}`), state.users[uid])
@@ -191,7 +548,7 @@ function saveUser(uid) {
 }
 
 function saveEvents() {
-  localStorage.setItem(STORAGE_KEY_LOCAL, JSON.stringify({ users: state.users, events: state.events }));
+  localStorage.setItem(STORAGE_KEY_LOCAL, JSON.stringify({ users: state.users, events: state.events, appConfig: state.appConfig }));
   if (!firebaseConnected) return;
   suppressFirebaseWrite = true;
   firebase.set(firebase.ref(firebaseDb, 'events'), state.events)
@@ -204,9 +561,13 @@ function mergeStateData(data) {
     for (const uid of ['user1', 'user2']) {
       if (data.users[uid]) state.users[uid] = { ...state.users[uid], ...data.users[uid] };
       if (!state.users[uid].shifts || !state.users[uid].shifts.length) state.users[uid].shifts = [...DEFAULT_SHIFTS];
+      if (!state.users[uid].tenure) state.users[uid].tenure = { startDate: null, manualDaysBefore: 0, periods: [], monthlyChecks: {} };
+      if (!state.users[uid].tenure.periods) state.users[uid].tenure.periods = [];
+      normalizeDays(state.users[uid]);
     }
   }
   if (data.events) state.events = data.events;
+  if (data.appConfig) state.appConfig = { ...state.appConfig, ...data.appConfig };
 }
 
 // ==========================================================================
@@ -300,8 +661,11 @@ function buildDayCell(year, month, day, otherMonth) {
   
   const user = state.users[state.currentUser];
   const dayData = user.days[dateKey];
-  if (dayData && dayData.shiftId) {
-    const shift = user.shifts.find(s => s.id === dayData.shiftId);
+  const dayShifts = dayData?.shifts || [];
+  
+  if (dayShifts.length === 1) {
+    // Single shift - paint whole cell
+    const shift = user.shifts.find(s => s.id === dayShifts[0].shiftId);
     if (shift) {
       cell.style.background = shift.color;
       const isDark = isColorDark(shift.color);
@@ -312,6 +676,26 @@ function buildDayCell(year, month, day, otherMonth) {
       codeEl.className = 'cal-day-shift';
       codeEl.textContent = shift.code;
       cell.appendChild(codeEl);
+    }
+  } else if (dayShifts.length > 1) {
+    // Multiple shifts - split horizontally (top half + bottom half)
+    const shifts = dayShifts.map(ds => user.shifts.find(s => s.id === ds.shiftId)).filter(Boolean);
+    if (shifts.length >= 2) {
+      const s1 = shifts[0], s2 = shifts[1];
+      cell.style.background = `linear-gradient(to bottom, ${s1.color} 0%, ${s1.color} 50%, ${s2.color} 50%, ${s2.color} 100%)`;
+      
+      const codesWrap = document.createElement('div');
+      codesWrap.style.cssText = 'width:100%;flex:1;display:flex;flex-direction:column;justify-content:space-around;align-items:center;margin-top:2px;';
+      
+      shifts.forEach((sh, idx) => {
+        const codeEl = document.createElement('div');
+        codeEl.style.cssText = `font-size:13px;font-weight:700;color:${isColorDark(sh.color)?'#fff':'#0a0a0a'};text-shadow:0 1px 2px rgba(0,0,0,0.4);line-height:1;`;
+        codeEl.textContent = sh.code;
+        codesWrap.appendChild(codeEl);
+      });
+      cell.appendChild(codesWrap);
+      // Number color - use top half color (s1)
+      num.style.color = isColorDark(s1.color) ? '#fff' : '#0a0a0a';
     }
   }
   
@@ -358,23 +742,22 @@ function openDaySheet(date) {
   const dateKey = formatDate(date);
   const user = state.users[state.currentUser];
   const dayData = user.days[dateKey] || {};
+  const dayShifts = dayData.shifts || [];
   const note = user.notes[dateKey] || '';
   const dayEvents = Object.values(state.events).filter(e => e.date === dateKey);
-  const currentShift = dayData.shiftId ? user.shifts.find(s => s.id === dayData.shiftId) : null;
-  const hoursValue = dayData.hours !== undefined ? dayData.hours : (currentShift ? currentShift.hours : 0);
   
   document.getElementById('daySheetTitle').textContent = date.toLocaleDateString('es-ES', { weekday: 'long', day: 'numeric', month: 'long' });
   document.getElementById('daySheetSubtitle').textContent = date.getFullYear();
   
+  // Working state for shifts (mutable)
+  window._editingShifts = JSON.parse(JSON.stringify(dayShifts));
+  if (!window._editingShifts.length) window._editingShifts = [];
+  
   const body = document.getElementById('daySheetBody');
   body.innerHTML = `
     <div class="section">
-      <div class="section-title">Turno</div>
-      <div class="shift-grid" id="shiftGrid"></div>
-    </div>
-    <div class="section">
-      <div class="section-title">Horas trabajadas</div>
-      <input type="number" class="input-field" id="dayHoursInput" value="${hoursValue}" step="0.5" min="0" max="24" placeholder="Horas">
+      <div class="section-title flex-between"><span>Turnos del día</span><span class="muted" style="font-size:10px;text-transform:none;letter-spacing:0;">Hasta 2 turnos</span></div>
+      <div id="daySlots"></div>
     </div>
     <div class="section">
       <div class="section-title">Nota del día</div>
@@ -392,29 +775,7 @@ function openDaySheet(date) {
     </div>
   `;
   
-  // Render shift options
-  const shiftGrid = document.getElementById('shiftGrid');
-  user.shifts.forEach(s => {
-    const opt = document.createElement('div');
-    opt.className = 'shift-option';
-    opt.style.setProperty('--shift-color', s.color);
-    if (dayData.shiftId === s.id) opt.classList.add('selected');
-    opt.innerHTML = `
-      ${s.hours ? `<div class="shift-hours-tag">${s.hours}h</div>` : ''}
-      <div class="shift-code">${escapeHtml(s.code)}</div>
-      <div class="shift-name">${escapeHtml(s.name)}</div>
-    `;
-    opt.onclick = () => {
-      shiftGrid.querySelectorAll('.shift-option').forEach(x => x.classList.remove('selected'));
-      opt.classList.add('selected');
-      opt.dataset.selected = s.id;
-      // update hours field too
-      document.getElementById('dayHoursInput').value = s.hours;
-      shiftGrid.dataset.selectedShift = s.id;
-    };
-    if (dayData.shiftId === s.id) shiftGrid.dataset.selectedShift = s.id;
-    shiftGrid.appendChild(opt);
-  });
+  renderDaySlots();
   
   // Render events for this day
   const evList = document.getElementById('dayEventsList');
@@ -438,6 +799,118 @@ function openDaySheet(date) {
   document.getElementById('daySheet').classList.add('active');
 }
 
+function renderDaySlots() {
+  const user = state.users[state.currentUser];
+  const slotsEl = document.getElementById('daySlots');
+  if (!slotsEl) return;
+  
+  let html = '';
+  // Slot 1
+  html += renderDaySlot(0, user, 'Turno 1');
+  // Slot 2 (only if slot 1 has a shift, or already has data)
+  if (window._editingShifts.length >= 1 && window._editingShifts[0]?.shiftId) {
+    if (window._editingShifts.length >= 2) {
+      html += renderDaySlot(1, user, 'Turno 2');
+    } else {
+      html += `<button class="btn btn-secondary btn-sm btn-block mt-12" onclick="addSecondShift()">+ Añadir 2º turno (turno doble)</button>`;
+    }
+  }
+  
+  slotsEl.innerHTML = html;
+  
+  // Attach click handlers to all shift options
+  document.querySelectorAll('[data-slot]').forEach(opt => {
+    opt.onclick = () => {
+      const slot = parseInt(opt.dataset.slot);
+      const shiftId = opt.dataset.shiftId;
+      selectDaySlotShift(slot, shiftId);
+    };
+  });
+}
+
+function renderDaySlot(idx, user, label) {
+  const slot = window._editingShifts[idx] || {};
+  const currentShift = slot.shiftId ? user.shifts.find(s => s.id === slot.shiftId) : null;
+  const hoursValue = slot.hours !== undefined ? slot.hours : (currentShift ? currentShift.hours : 0);
+  
+  const grid = user.shifts.map(s => `
+    <div class="shift-option ${slot.shiftId === s.id ? 'selected' : ''}" data-slot="${idx}" data-shift-id="${s.id}" style="--shift-color:${s.color};">
+      ${s.hours ? `<div class="shift-hours-tag">${s.hours}h</div>` : ''}
+      <div class="shift-code">${escapeHtml(s.code)}</div>
+      <div class="shift-name">${escapeHtml(s.name)}</div>
+    </div>
+  `).join('');
+  
+  return `
+    <div style="margin-top:${idx===0?'0':'14px'};">
+      <div class="flex-between" style="margin-bottom:8px;">
+        <div style="font-size:13px;font-weight:600;color:var(--text-dim);">${label}</div>
+        ${idx === 1 ? `<button class="btn-ghost" style="background:transparent;border:none;color:var(--danger);font-size:12px;cursor:pointer;padding:0;" onclick="removeSecondShift()">✕ Quitar</button>` : ''}
+      </div>
+      <div class="shift-grid">${grid}</div>
+      <div style="margin-top:8px;">
+        <label class="input-label">Horas</label>
+        <input type="number" class="input-field" data-hours-slot="${idx}" value="${hoursValue}" step="0.5" min="0" max="24" placeholder="Horas" onchange="updateSlotHours(${idx}, this.value)">
+      </div>
+    </div>
+  `;
+}
+
+function selectDaySlotShift(slot, shiftId) {
+  const user = state.users[state.currentUser];
+  const shift = user.shifts.find(s => s.id === shiftId);
+  if (!shift) return;
+  // Toggle off if same
+  if (window._editingShifts[slot]?.shiftId === shiftId) {
+    if (slot === 1) {
+      window._editingShifts.splice(1, 1);
+    } else {
+      window._editingShifts[0] = null;
+    }
+  } else {
+    window._editingShifts[slot] = { shiftId, hours: shift.hours };
+  }
+  // Clean up nulls
+  window._editingShifts = window._editingShifts.filter(x => x && x.shiftId);
+  renderDaySlots();
+}
+
+function updateSlotHours(slot, val) {
+  const h = parseFloat(val) || 0;
+  if (window._editingShifts[slot]) {
+    window._editingShifts[slot].hours = h;
+  }
+}
+
+function addSecondShift() {
+  // Show empty 2nd slot
+  window._editingShifts.push({ shiftId: null, hours: 0 });
+  // Use a placeholder so it renders the grid
+  window._editingShifts[1] = { shiftId: '__placeholder__', hours: 0 };
+  // Render and then clean
+  const slotsEl = document.getElementById('daySlots');
+  // Force render with placeholder visible
+  const user = state.users[state.currentUser];
+  // Render slot 0
+  let html = renderDaySlot(0, user, 'Turno 1');
+  // For slot 1 we need a custom render since shiftId is fake
+  const fakeSlot = window._editingShifts[1];
+  window._editingShifts[1] = { shiftId: null, hours: 0 };
+  html += renderDaySlot(1, user, 'Turno 2');
+  slotsEl.innerHTML = html;
+  document.querySelectorAll('[data-slot]').forEach(opt => {
+    opt.onclick = () => {
+      const s = parseInt(opt.dataset.slot);
+      selectDaySlotShift(s, opt.dataset.shiftId);
+    };
+  });
+}
+
+function removeSecondShift() {
+  window._editingShifts.splice(1, 1);
+  renderDaySlots();
+}
+
 function closeDaySheet() {
   document.getElementById('dayOverlay').classList.remove('active');
   document.getElementById('daySheet').classList.remove('active');
@@ -448,12 +921,20 @@ function saveDay() {
   if (!state.selectedDate) return;
   const dateKey = formatDate(state.selectedDate);
   const user = state.users[state.currentUser];
-  const shiftId = document.getElementById('shiftGrid').dataset.selectedShift;
-  const hours = parseFloat(document.getElementById('dayHoursInput').value) || 0;
+  
+  // Get hours from inputs (in case user edited but didn't blur)
+  document.querySelectorAll('[data-hours-slot]').forEach(inp => {
+    const slot = parseInt(inp.dataset.hoursSlot);
+    if (window._editingShifts[slot]) {
+      window._editingShifts[slot].hours = parseFloat(inp.value) || 0;
+    }
+  });
+  
+  const validShifts = window._editingShifts.filter(s => s && s.shiftId);
   const note = document.getElementById('dayNoteInput').value.trim();
   
-  if (shiftId) {
-    user.days[dateKey] = { shiftId, hours };
+  if (validShifts.length) {
+    user.days[dateKey] = { shifts: validShifts };
   } else {
     delete user.days[dateKey];
   }
@@ -635,7 +1116,7 @@ function applyPattern() {
       const shiftId = window._patternSeq[idx % window._patternSeq.length];
       const shift = user.shifts.find(x => x.id === shiftId);
       if (shift) {
-        user.days[key] = { shiftId, hours: shift.hours };
+        user.days[key] = { shifts: [{ shiftId, hours: shift.hours }] };
         count++;
       }
     }
@@ -908,18 +1389,23 @@ function renderStats() {
   let totalHours = 0;
   
   for (const [key, val] of Object.entries(user.days)) {
-    if (!val.shiftId) continue;
+    const shifts = getDayShifts(val);
+    if (!shifts.length) continue;
     const d = new Date(key + 'T00:00:00');
     if (isMonth) {
       if (d.getFullYear() !== state.statsYear || d.getMonth() !== state.statsMonth) continue;
     } else {
       if (d.getFullYear() !== state.statsYear) continue;
     }
-    counts[val.shiftId] = counts[val.shiftId] || { days: 0, hours: 0 };
-    counts[val.shiftId].days++;
-    counts[val.shiftId].hours += val.hours || 0;
-    totalDays++;
-    totalHours += val.hours || 0;
+    let dayHasWork = false;
+    for (const ds of shifts) {
+      counts[ds.shiftId] = counts[ds.shiftId] || { days: 0, hours: 0 };
+      counts[ds.shiftId].days++;
+      counts[ds.shiftId].hours += ds.hours || 0;
+      totalHours += ds.hours || 0;
+      dayHasWork = true;
+    }
+    if (dayHasWork) totalDays++;
   }
   
   const content = document.getElementById('statsContent');
@@ -1005,8 +1491,12 @@ function renderStats() {
       if (lineEl) {
         const monthlyHours = new Array(12).fill(0);
         for (const [key, val] of Object.entries(user.days)) {
+          const shifts = getDayShifts(val);
+          if (!shifts.length) continue;
           const d = new Date(key + 'T00:00:00');
-          if (d.getFullYear() === state.statsYear) monthlyHours[d.getMonth()] += val.hours || 0;
+          if (d.getFullYear() === state.statsYear) {
+            for (const ds of shifts) monthlyHours[d.getMonth()] += ds.hours || 0;
+          }
         }
         chartInstances.line = new Chart(lineEl, {
           type: 'line',
@@ -1087,8 +1577,8 @@ function buildPayrollEl(p) {
       <div class="payroll-amount"><div class="v">${formatMoney(p.net)}</div><div class="l">Neto</div></div>
       <div class="payroll-amount"><div class="v">${formatMoney(p.withheld)}</div><div class="l">Retenido</div></div>
     </div>
-    ${p.fileUrl || p.driveLink ? `<div class="payroll-file">
-      📎 ${p.fileUrl ? `<a href="${p.fileUrl}" target="_blank">${escapeHtml(p.fileName || 'Ver archivo')}</a>` : `<a href="${escapeHtml(p.driveLink)}" target="_blank">Ver en Drive</a>`}
+    ${p.driveLink ? `<div class="payroll-file">
+      🔗 <a href="${escapeHtml(p.driveLink)}" target="_blank" rel="noopener">Ver PDF en Drive</a>
     </div>` : ''}
   `;
   return el;
@@ -1115,22 +1605,25 @@ function openPayrollEditor(payrollId) {
     <label class="input-label mt-12">Etiqueta (opcional)</label>
     <input type="text" class="input-field" id="payLabel" value="${p && p.label ? escapeHtml(p.label) : ''}" placeholder="Nómina, paga extra, finiquito...">
     
-    <label class="input-label mt-12">Bruto (€)</label>
+    <div style="margin-top:14px;padding:12px;background:var(--panel);border-radius:10px;border:1px dashed var(--border);">
+      <div class="section-title" style="margin:0 0 8px;">📄 Lectura automática del PDF</div>
+      <p class="muted" style="font-size:12px;margin:0 0 8px;">Sube el PDF, la app leerá los importes automáticamente. El archivo no se guarda — solo se usa para extraer los datos.</p>
+      <input type="file" class="input-field" id="payFile" accept="application/pdf">
+      <button class="btn btn-secondary btn-sm btn-block mt-8" onclick="tryReadPdfAmounts()">📄 Leer importes</button>
+    </div>
+    
+    <label class="input-label mt-12">Bruto / Devengos (€)</label>
     <input type="number" class="input-field" id="payGross" value="${p ? p.gross : ''}" step="0.01" placeholder="0.00">
     
-    <label class="input-label mt-12">Neto (€)</label>
+    <label class="input-label mt-12">Neto / Líquido (€)</label>
     <input type="number" class="input-field" id="payNet" value="${p ? p.net : ''}" step="0.01" placeholder="0.00">
     
-    <label class="input-label mt-12">Importe retenido (€)</label>
+    <label class="input-label mt-12">Importe retenido IRPF (€)</label>
     <input type="number" class="input-field" id="payWith" value="${p ? p.withheld : ''}" step="0.01" placeholder="0.00">
     
-    <label class="input-label mt-12">📎 Archivo PDF (opcional)</label>
-    <input type="file" class="input-field" id="payFile" accept="application/pdf">
-    ${p && p.fileUrl ? `<div class="muted mt-8" style="font-size:11px;">Archivo actual: ${escapeHtml(p.fileName || 'archivo.pdf')}</div>` : ''}
-    <button class="btn btn-secondary btn-sm btn-block mt-8" onclick="tryReadPdfAmounts()">📄 Leer importes del PDF</button>
-    
-    <label class="input-label mt-12">o enlace de Google Drive</label>
+    <label class="input-label mt-12">🔗 Enlace de Google Drive (recomendado)</label>
     <input type="url" class="input-field" id="payDrive" value="${p && p.driveLink ? escapeHtml(p.driveLink) : ''}" placeholder="https://drive.google.com/...">
+    <p class="muted" style="font-size:11px;margin-top:6px;">Sube el PDF a Drive y pega el enlace compartido aquí. Así tendrás siempre acceso al archivo original.</p>
   `, [
     ...(p ? [{ text: 'Eliminar', class: 'btn-danger', onClick: () => deletePayroll(payrollId) }] : []),
     { text: 'Cancelar', class: 'btn-secondary', onClick: closeModal },
@@ -1147,23 +1640,44 @@ async function tryReadPdfAmounts() {
     const buf = await file.arrayBuffer();
     pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
     const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+    
+    // Collect text items with position info for better extraction
+    let allItems = [];
     let fullText = '';
     for (let i = 1; i <= pdf.numPages; i++) {
       const page = await pdf.getPage(i);
       const tc = await page.getTextContent();
+      tc.items.forEach(it => {
+        if (it.str.trim()) {
+          allItems.push({ text: it.str, x: it.transform[4], y: it.transform[5] });
+        }
+      });
       fullText += tc.items.map(it => it.str).join(' ') + ' ';
     }
     
-    // Heuristic search
-    const lower = fullText.toLowerCase();
-    const result = extractPayrollNumbers(fullText, lower);
+    // Try Generalitat Valenciana style first (your PDF format)
+    const result = extractPayrollNumbers(fullText, allItems);
     
-    if (result.gross) document.getElementById('payGross').value = result.gross.toFixed(2);
-    if (result.net) document.getElementById('payNet').value = result.net.toFixed(2);
-    if (result.withheld) document.getElementById('payWith').value = result.withheld.toFixed(2);
+    if (result.gross != null) document.getElementById('payGross').value = result.gross.toFixed(2);
+    if (result.net != null) document.getElementById('payNet').value = result.net.toFixed(2);
+    if (result.withheld != null) document.getElementById('payWith').value = result.withheld.toFixed(2);
     
-    if (result.gross || result.net || result.withheld) {
-      toast(`Leídos: ${[result.gross && 'Bruto', result.net && 'Neto', result.withheld && 'Retenido'].filter(Boolean).join(', ')}. Revisa antes de guardar.`, 'success');
+    // Also try to detect month/year
+    if (result.detectedMonth != null) {
+      document.getElementById('payMonth').value = result.detectedMonth;
+    }
+    if (result.detectedYear != null) {
+      document.getElementById('payYear').value = result.detectedYear;
+    }
+    
+    const found = [];
+    if (result.gross != null) found.push('Bruto');
+    if (result.net != null) found.push('Neto');
+    if (result.withheld != null) found.push('Retenido');
+    if (result.detectedMonth != null || result.detectedYear != null) found.push('Fecha');
+    
+    if (found.length) {
+      toast(`Leídos: ${found.join(', ')}. Revisa antes de guardar.`, 'success');
     } else {
       toast('No se han podido extraer importes. Introdúcelos a mano.', 'error');
     }
@@ -1173,25 +1687,129 @@ async function tryReadPdfAmounts() {
   }
 }
 
-function extractPayrollNumbers(text, lowerText) {
-  // Try to find common Spanish payroll labels
-  const findNumber = (patterns) => {
-    for (const pat of patterns) {
-      const regex = new RegExp(pat + '[^0-9]{0,40}([0-9]{1,3}(?:[\\.,][0-9]{3})*[\\.,][0-9]{2})', 'i');
-      const m = text.match(regex);
-      if (m) {
-        const num = parseFloat(m[1].replace(/\./g,'').replace(',','.'));
-        if (!isNaN(num) && num > 0 && num < 1000000) return num;
+function parseSpanishNumber(s) {
+  if (!s) return null;
+  // Spanish format: 1.592,00 → 1592.00
+  const cleaned = String(s).trim().replace(/\s/g, '').replace(/\./g, '').replace(',', '.');
+  const n = parseFloat(cleaned);
+  return (!isNaN(n) && isFinite(n)) ? n : null;
+}
+
+function extractPayrollNumbers(text, items) {
+  const result = { gross: null, net: null, withheld: null, detectedMonth: null, detectedYear: null };
+  
+  // Number regex (Spanish format: thousands with . and decimals with ,)
+  const numRe = /([0-9]{1,3}(?:\.[0-9]{3})*,[0-9]{2})/g;
+  
+  // === Strategy 1: For Generalitat Valenciana style nóminas ===
+  // The structure has line items like "1 SUELDO 749,58", "98 RETENCION IRPF 237,05"
+  // Devengos = sum of items in left column (codes 1-50 typically)
+  // Deducciones = items in right column (codes 90-110 typically)
+  
+  // Try to find the IRPF withholding amount (specific line)
+  const irpfLineMatch = text.match(/(?:\d+\s+)?RETENCI[OÓ]N\s+IRPF\s+([0-9]{1,3}(?:\.[0-9]{3})*,[0-9]{2})/i);
+  if (irpfLineMatch) {
+    result.withheld = parseSpanishNumber(irpfLineMatch[1]);
+  }
+  
+  // Find "TOTALS / Totales" followed by two numbers (gross, total deductions)
+  // Note: the labels and numbers may be separated in the text extraction
+  const totalsBlock = text.match(/TOTALS?\s*\/?\s*Totales[\s\S]{0,200}?([0-9]{1,3}(?:\.[0-9]{3})*,[0-9]{2})\s*([0-9]{1,3}(?:\.[0-9]{3})*,[0-9]{2})/i);
+  if (totalsBlock) {
+    // In Generalitat format: deductions appear first, then devengos (gross)
+    // Try both orders
+    const a = parseSpanishNumber(totalsBlock[1]);
+    const b = parseSpanishNumber(totalsBlock[2]);
+    if (a != null && b != null) {
+      // Usually larger = gross, smaller = deductions
+      if (b > a) {
+        result.gross = b;
+        // If we don't have withheld yet and total deductions equals IRPF (rare)
+        // we still trust the irpfLineMatch above
+      } else {
+        result.gross = a;
       }
     }
-    return null;
-  };
+  }
   
-  return {
-    gross: findNumber(['total devengado', 'total devengos', 'devengos totales', 'salario bruto', 'a\\s*deveng', 'íntegro', 'integro', 'bruto']),
-    net: findNumber(['líquido a percibir', 'liquido a percibir', 'l[ií]quido total', 'total a percibir', 'neto a percibir', 'l[ií]quido']),
-    withheld: findNumber(['i\\.?\\s*r\\.?\\s*p\\.?\\s*f', 'irpf', 'retenci[oó]n', 'total a deducir', 'total deducciones'])
-  };
+  // Calculate net = gross - total deductions if possible
+  // First find total deductions
+  if (result.gross == null) {
+    // Fallback: sum all numbers preceded by code numbers 1-89 (devengos)
+    let sumDevengos = 0;
+    const lineRe = /(?:^|\n)\s*(\d{1,3})\s+([A-ZÁÉÍÓÚÑa-záéíóúñ\.\s/]+?)\s+([0-9]{1,3}(?:\.[0-9]{3})*,[0-9]{2})/g;
+    let m;
+    while ((m = lineRe.exec(text)) !== null) {
+      const code = parseInt(m[1]);
+      const concept = m[2].trim().toLowerCase();
+      const amount = parseSpanishNumber(m[3]);
+      // Codes 1-89 are typically devengos, 90+ are deducciones
+      // But also detect by concept: "retencion", "irpf", "contingencias", "formacion" = deduction
+      const isDeduction = code >= 90 || /retenci|irpf|contingenci|formaci[oó]n|cuota|seguridad social/.test(concept);
+      if (!isDeduction && amount != null && amount < 50000) {
+        sumDevengos += amount;
+      }
+    }
+    if (sumDevengos > 0) result.gross = Math.round(sumDevengos * 100) / 100;
+  }
+  
+  // Try to find net (LIQUID / Líquido)
+  // The number after LIQUID is normally the net amount
+  // Try matching after the "LIQUID / Líquido:" label
+  const liquidBlock = text.match(/(?:LIQUID|L[ÍI]QUIDO)\s*\/?\s*L[ií]quido[\s\S]{0,300}?([0-9]{1,3}(?:\.[0-9]{3})*,[0-9]{2})/i);
+  if (liquidBlock) {
+    // In Generalitat format, the net comes much later among other numbers
+    // Let's instead try: extract ALL numbers after "LIQUID" and pick the one that matches gross - deductions
+    const afterLiquid = text.substring(text.search(/LIQUID|L[ÍI]QUIDO/i));
+    const nums = [];
+    let nm;
+    const allNumRe = /([0-9]{1,3}(?:\.[0-9]{3})*,[0-9]{2})/g;
+    while ((nm = allNumRe.exec(afterLiquid)) !== null) {
+      const n = parseSpanishNumber(nm[1]);
+      if (n != null && n > 0) nums.push(n);
+    }
+    
+    // Calculate deductions total (sum of items with code 90+)
+    let sumDed = 0;
+    const lineRe2 = /(?:^|\n)\s*(\d{1,3})\s+([A-ZÁÉÍÓÚÑa-záéíóúñ\.\s/]+?)\s+([0-9]{1,3}(?:\.[0-9]{3})*,[0-9]{2})/g;
+    let lm;
+    while ((lm = lineRe2.exec(text)) !== null) {
+      const code = parseInt(lm[1]);
+      const concept = lm[2].trim().toLowerCase();
+      const amount = parseSpanishNumber(lm[3]);
+      const isDed = code >= 90 || /retenci|irpf|contingenci|formaci[oó]n/.test(concept);
+      if (isDed && amount != null) sumDed += amount;
+    }
+    
+    // Computed net
+    if (result.gross != null && sumDed > 0) {
+      const computedNet = Math.round((result.gross - sumDed) * 100) / 100;
+      // Look for this number in the nums array (with small tolerance)
+      const found = nums.find(n => Math.abs(n - computedNet) < 0.1);
+      if (found != null) result.net = found;
+      else if (computedNet > 0) result.net = computedNet; // use computed
+    }
+    
+    // Fallback: take first number after LIQUID that's not the gross or deductions
+    if (result.net == null && liquidBlock[1]) {
+      result.net = parseSpanishNumber(liquidBlock[1]);
+    }
+  }
+  
+  // === Period detection: "04/2026 - Normal" or "01/04/2026 - 30/04/2026" ===
+  const periodMatch = text.match(/(\d{2})\/(\d{4})\s*-?\s*Normal/i);
+  if (periodMatch) {
+    result.detectedMonth = parseInt(periodMatch[1]) - 1;
+    result.detectedYear = parseInt(periodMatch[2]);
+  } else {
+    const rangeMatch = text.match(/\d{2}\/(\d{2})\/(\d{4})\s*-\s*\d{2}\/\d{2}\/\d{4}/);
+    if (rangeMatch) {
+      result.detectedMonth = parseInt(rangeMatch[1]) - 1;
+      result.detectedYear = parseInt(rangeMatch[2]);
+    }
+  }
+  
+  return result;
 }
 
 async function savePayroll(payrollId) {
@@ -1202,33 +1820,22 @@ async function savePayroll(payrollId) {
   const net = parseFloat(document.getElementById('payNet').value) || 0;
   const withheld = parseFloat(document.getElementById('payWith').value) || 0;
   const driveLink = document.getElementById('payDrive').value.trim();
-  const fileInput = document.getElementById('payFile');
+  
+  if (gross === 0 && net === 0 && withheld === 0) {
+    if (!confirm('Todos los importes están a 0. ¿Guardar igualmente?')) return;
+  }
   
   const user = state.users[state.currentUser];
   const id = payrollId || ('p' + Date.now() + Math.floor(Math.random()*1000));
-  const existing = user.payrolls[id] || {};
   
-  let fileUrl = existing.fileUrl;
-  let fileName = existing.fileName;
-  
-  if (fileInput.files.length) {
-    if (!firebaseStorage) { toast('Storage no disponible. Usa enlace de Drive.', 'error'); return; }
-    try {
-      toast('Subiendo archivo...', 'info');
-      const file = fileInput.files[0];
-      const path = `payrolls/${state.currentUser}/${id}_${file.name}`;
-      const ref = firebase.sRef(firebaseStorage, path);
-      await firebase.uploadBytes(ref, file);
-      fileUrl = await firebase.getDownloadURL(ref);
-      fileName = file.name;
-    } catch (err) {
-      console.error(err);
-      toast('Error subiendo archivo: ' + err.message, 'error');
-      return;
-    }
-  }
-  
-  user.payrolls[id] = { id, month, year, label: label || null, gross, net, withheld, fileUrl: fileUrl || null, fileName: fileName || null, driveLink: driveLink || null };
+  // Note: file is NOT saved - only used for reading values
+  user.payrolls[id] = { 
+    id, month, year, 
+    label: label || null, 
+    gross, net, withheld, 
+    driveLink: driveLink || null,
+    updatedAt: Date.now()
+  };
   saveUser(state.currentUser);
   closeModal();
   renderPayrolls();
@@ -1238,14 +1845,6 @@ async function savePayroll(payrollId) {
 function deletePayroll(payrollId) {
   if (!confirm('¿Eliminar esta nómina?')) return;
   const user = state.users[state.currentUser];
-  const p = user.payrolls[payrollId];
-  if (p && p.fileUrl && firebaseStorage) {
-    // Try to delete file too
-    try {
-      const path = `payrolls/${state.currentUser}/${payrollId}_${p.fileName}`;
-      firebase.deleteObject(firebase.sRef(firebaseStorage, path)).catch(()=>{});
-    } catch(e) {}
-  }
   delete user.payrolls[payrollId];
   saveUser(state.currentUser);
   closeModal();
@@ -1292,42 +1891,65 @@ function openPayrollChart() {
 // ==========================================================================
 function renderTenure() {
   const user = state.users[state.currentUser];
-  const t = user.tenure || { startDate: null, manualDaysBefore: 0, monthlyChecks: {} };
+  const t = user.tenure || { startDate: null, manualDaysBefore: 0, periods: [], monthlyChecks: {} };
+  if (!t.periods) t.periods = [];
   const content = document.getElementById('tenureContent');
   
-  if (!t.startDate) {
+  if (!t.startDate && (!t.periods || !t.periods.length)) {
     content.innerHTML = `
       <div class="empty">
         <div class="empty-icon">⏳</div>
-        <div class="empty-title">Sin fecha de inicio</div>
-        <div class="empty-desc">Configura tu fecha de entrada en la empresa</div>
+        <div class="empty-title">Sin configurar</div>
+        <div class="empty-desc">Configura tu fecha de entrada o añade periodos previos</div>
       </div>
       <div style="padding:0 16px;"><button class="btn btn-block" onclick="openTenureSetup()">Configurar antigüedad</button></div>
     `;
     return;
   }
   
-  const startDate = new Date(t.startDate + 'T00:00:00');
   const today = new Date();
   
-  // Days from app (counts shifts that aren't libre/vac/fest etc - by default any day with a shift counts)
+  // Days from periods (manually defined)
+  let periodsDays = 0;
+  (t.periods || []).forEach(p => {
+    if (p.mode === 'manual') {
+      periodsDays += parseInt(p.manualDays) || 0;
+    } else {
+      // Count days between start and end inclusive
+      if (p.startDate && p.endDate) {
+        const s = new Date(p.startDate + 'T00:00:00');
+        const e = new Date(p.endDate + 'T00:00:00');
+        if (!isNaN(s) && !isNaN(e) && e >= s) {
+          periodsDays += Math.floor((e - s) / (1000 * 60 * 60 * 24)) + 1;
+        }
+      }
+    }
+  });
+  
+  // Days from app (worked days with hours > 0)
   let workedDaysFromApp = 0;
+  const startDate = t.startDate ? new Date(t.startDate + 'T00:00:00') : null;
+  
   for (const [key, val] of Object.entries(user.days)) {
-    if (!val.shiftId) continue;
-    const shift = user.shifts.find(s => s.id === val.shiftId);
-    if (!shift) continue;
-    const isWorkDay = shift.hours > 0; // shifts with hours count as worked
-    if (!isWorkDay) continue;
+    const shifts = getDayShifts(val);
+    if (!shifts.length) continue;
+    // Check if any shift counts as worked (hours > 0)
+    const hasWorkedShift = shifts.some(ds => {
+      const sh = user.shifts.find(s => s.id === ds.shiftId);
+      return sh && sh.hours > 0;
+    });
+    if (!hasWorkedShift) continue;
     const d = new Date(key + 'T00:00:00');
-    if (d < startDate || d > today) continue;
-    // Apply monthly check: if a check exists for that month and the day is excluded, skip
-    const monthKey = key.slice(0, 7); // YYYY-MM
-    const check = t.monthlyChecks[monthKey];
+    if (startDate && d < startDate) continue;
+    if (d > today) continue;
+    // Apply monthly check
+    const monthKey = key.slice(0, 7);
+    const check = t.monthlyChecks?.[monthKey];
     if (check && check.excludedDays && check.excludedDays.includes(key)) continue;
     workedDaysFromApp++;
   }
   
-  const totalDays = (t.manualDaysBefore || 0) + workedDaysFromApp;
+  const totalDays = periodsDays + (t.manualDaysBefore || 0) + workedDaysFromApp;
   const years = Math.floor(totalDays / 365.25);
   const remainingDays = totalDays - Math.floor(years * 365.25);
   const months = Math.floor(remainingDays / 30.44);
@@ -1337,6 +1959,36 @@ function renderTenure() {
   const nextTrienio = (trienios + 1) * 3;
   const daysToNextTrienio = Math.ceil((nextTrienio * 365.25) - totalDays);
   const progressToNextTrienio = ((totalDays - trienios * 3 * 365.25) / (3 * 365.25)) * 100;
+  
+  // Build periods list
+  let periodsHtml = '';
+  if (t.periods && t.periods.length) {
+    periodsHtml = '<div style="padding:0 16px;"><div class="section-title" style="margin:10px 0 8px;">Periodos previos</div>';
+    t.periods.forEach((p, idx) => {
+      const sLabel = p.startDate ? new Date(p.startDate + 'T00:00:00').toLocaleDateString('es-ES') : '?';
+      const eLabel = p.endDate ? new Date(p.endDate + 'T00:00:00').toLocaleDateString('es-ES') : '?';
+      let pDays = 0;
+      if (p.mode === 'manual') {
+        pDays = parseInt(p.manualDays) || 0;
+      } else if (p.startDate && p.endDate) {
+        const s = new Date(p.startDate + 'T00:00:00');
+        const e = new Date(p.endDate + 'T00:00:00');
+        if (!isNaN(s) && !isNaN(e) && e >= s) pDays = Math.floor((e-s)/(1000*60*60*24)) + 1;
+      }
+      periodsHtml += `
+        <div class="event-item" style="margin-bottom:8px;" onclick="editTenurePeriod(${idx})">
+          <div class="flex-between">
+            <div>
+              <div style="font-weight:600;font-size:13px;">${sLabel} → ${eLabel}</div>
+              <div class="muted" style="font-size:11px;margin-top:2px;">${p.mode === 'manual' ? 'Parcial' : 'Completo'} · ${pDays} día${pDays===1?'':'s'}${p.note ? ' · ' + escapeHtml(p.note) : ''}</div>
+            </div>
+            <div style="color:var(--text-dim);font-size:18px;">›</div>
+          </div>
+        </div>
+      `;
+    });
+    periodsHtml += '</div>';
+  }
   
   content.innerHTML = `
     <div class="tenure-card">
@@ -1356,8 +2008,15 @@ function renderTenure() {
     <div class="settings-section" style="margin-top:0;">
       <div class="settings-row" onclick="openTenureSetup()">
         <div>
-          <div class="settings-row-title">Configuración</div>
-          <div class="settings-row-desc">Fecha inicio y días previos</div>
+          <div class="settings-row-title">Configuración general</div>
+          <div class="settings-row-desc">Fecha inicio en la app</div>
+        </div>
+        <div class="settings-row-value">›</div>
+      </div>
+      <div class="settings-row" onclick="editTenurePeriod(null)">
+        <div>
+          <div class="settings-row-title">+ Añadir periodo previo</div>
+          <div class="settings-row-desc">Trabajo anterior, otra empresa, etc.</div>
         </div>
         <div class="settings-row-value">›</div>
       </div>
@@ -1370,10 +2029,14 @@ function renderTenure() {
       </div>
     </div>
     
+    ${periodsHtml}
+    
     <div style="padding:8px 16px 16px;">
-      <div class="muted" style="font-size:12px;text-align:center;">
-        Inicio: ${startDate.toLocaleDateString('es-ES')}<br>
-        ${t.manualDaysBefore ? `${t.manualDaysBefore} días manuales + ` : ''}${workedDaysFromApp} días desde uso de la app
+      <div class="muted" style="font-size:11px;text-align:center;line-height:1.6;">
+        ${startDate ? `Uso de la app desde: ${startDate.toLocaleDateString('es-ES')}<br>` : ''}
+        ${periodsDays ? `${periodsDays} días de periodos previos<br>` : ''}
+        ${t.manualDaysBefore ? `${t.manualDaysBefore} días manuales extra<br>` : ''}
+        ${workedDaysFromApp} días trabajados en la app
       </div>
     </div>
   `;
@@ -1382,12 +2045,14 @@ function renderTenure() {
 function openTenureSetup() {
   const user = state.users[state.currentUser];
   const t = user.tenure || {};
-  openModal('Antigüedad', `
-    <label class="input-label">Fecha de inicio en la empresa</label>
+  openModal('Configuración antigüedad', `
+    <label class="input-label">Fecha de inicio usando esta app</label>
     <input type="date" class="input-field" id="tenStart" value="${t.startDate || ''}">
-    <label class="input-label mt-12">Días trabajados antes de usar la app</label>
+    <p class="muted" style="font-size:12px;margin-top:6px;">Desde esta fecha contarán los turnos registrados como días trabajados.</p>
+    
+    <label class="input-label mt-12">Días manuales extra (opcional)</label>
     <input type="number" class="input-field" id="tenManual" value="${t.manualDaysBefore || 0}" min="0">
-    <p class="muted" style="font-size:12px;margin-top:6px;">Solo días de alta efectiva, sin contar bajas o interrupciones.</p>
+    <p class="muted" style="font-size:12px;margin-top:6px;">Días sueltos que no encajan en ningún periodo. Para periodos largos usa "Añadir periodo previo".</p>
   `, [
     { text: 'Cancelar', class: 'btn-secondary', onClick: closeModal },
     { text: 'Guardar', onClick: () => {
@@ -1395,6 +2060,7 @@ function openTenureSetup() {
       const manual = parseInt(document.getElementById('tenManual').value) || 0;
       user.tenure.startDate = start || null;
       user.tenure.manualDaysBefore = manual;
+      if (!user.tenure.periods) user.tenure.periods = [];
       saveUser(state.currentUser);
       closeModal();
       renderTenure();
@@ -1403,9 +2069,124 @@ function openTenureSetup() {
   ]);
 }
 
+function editTenurePeriod(idx) {
+  const user = state.users[state.currentUser];
+  if (!user.tenure.periods) user.tenure.periods = [];
+  const p = idx !== null && idx !== undefined ? user.tenure.periods[idx] : null;
+  
+  const html = `
+    <label class="input-label">Fecha inicio</label>
+    <input type="date" class="input-field" id="prdStart" value="${p ? (p.startDate || '') : ''}">
+    
+    <label class="input-label mt-12">Fecha fin</label>
+    <input type="date" class="input-field" id="prdEnd" value="${p ? (p.endDate || '') : ''}">
+    
+    <label class="input-label mt-12">¿Trabajaste a tiempo completo?</label>
+    <div style="display:flex;gap:8px;margin-top:6px;">
+      <button type="button" id="modeFullBtn" class="btn ${(!p || p.mode !== 'manual') ? '' : 'btn-secondary'}" style="flex:1;font-size:13px;" onclick="setPeriodMode('full')">Todos los días</button>
+      <button type="button" id="modeManualBtn" class="btn ${p && p.mode === 'manual' ? '' : 'btn-secondary'}" style="flex:1;font-size:13px;" onclick="setPeriodMode('manual')">Tiempo parcial</button>
+    </div>
+    
+    <div id="manualDaysWrap" style="display:${p && p.mode === 'manual' ? 'block' : 'none'};">
+      <label class="input-label mt-12">Días trabajados en este periodo</label>
+      <input type="number" class="input-field" id="prdManualDays" value="${p && p.manualDays ? p.manualDays : ''}" min="0" placeholder="Ej: 180">
+      <p class="muted" style="font-size:12px;margin-top:6px;">Suma manual de días efectivamente trabajados.</p>
+    </div>
+    
+    <label class="input-label mt-12">Nota (opcional)</label>
+    <input type="text" class="input-field" id="prdNote" value="${p && p.note ? escapeHtml(p.note) : ''}" placeholder="Empresa, descripción...">
+    
+    <div id="prdSummary" class="muted mt-12" style="font-size:12px;text-align:center;padding:8px;background:var(--panel);border-radius:8px;"></div>
+  `;
+  
+  window._editingPeriod = { mode: p ? (p.mode || 'full') : 'full' };
+  
+  const buttons = [];
+  if (p) buttons.push({ text: 'Eliminar', class: 'btn-danger', onClick: () => { 
+    if (confirm('¿Eliminar este periodo?')) {
+      user.tenure.periods.splice(idx, 1);
+      saveUser(state.currentUser);
+      closeModal();
+      renderTenure();
+      toast('Eliminado', 'success');
+    }
+  }});
+  buttons.push({ text: 'Cancelar', class: 'btn-secondary', onClick: closeModal });
+  buttons.push({ text: 'Guardar', onClick: () => savePeriod(idx) });
+  
+  openModal(p ? 'Editar periodo' : 'Nuevo periodo previo', html, buttons);
+  
+  // Update summary live
+  setTimeout(() => {
+    const updateSummary = () => {
+      const s = document.getElementById('prdStart').value;
+      const e = document.getElementById('prdEnd').value;
+      const mode = window._editingPeriod.mode;
+      const sEl = document.getElementById('prdSummary');
+      if (!s || !e) { sEl.textContent = ''; return; }
+      const sd = new Date(s + 'T00:00:00');
+      const ed = new Date(e + 'T00:00:00');
+      if (ed < sd) { sEl.textContent = 'La fecha fin debe ser posterior'; sEl.style.color = 'var(--danger)'; return; }
+      sEl.style.color = '';
+      const totalRange = Math.floor((ed - sd)/(1000*60*60*24)) + 1;
+      if (mode === 'manual') {
+        const m = parseInt(document.getElementById('prdManualDays').value) || 0;
+        sEl.innerHTML = `Rango de ${totalRange} días naturales · <strong>${m} días</strong> contarán para antigüedad`;
+      } else {
+        sEl.innerHTML = `<strong>${totalRange} días</strong> contarán para antigüedad`;
+      }
+    };
+    ['prdStart','prdEnd','prdManualDays'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) {
+        el.addEventListener('input', updateSummary);
+        el.addEventListener('change', updateSummary);
+      }
+    });
+    updateSummary();
+  }, 50);
+}
+
+function setPeriodMode(mode) {
+  window._editingPeriod.mode = mode;
+  document.getElementById('modeFullBtn').className = 'btn ' + (mode === 'full' ? '' : 'btn-secondary');
+  document.getElementById('modeManualBtn').className = 'btn ' + (mode === 'manual' ? '' : 'btn-secondary');
+  document.getElementById('manualDaysWrap').style.display = mode === 'manual' ? 'block' : 'none';
+  // Update summary
+  const ev = new Event('input');
+  document.getElementById('prdStart').dispatchEvent(ev);
+}
+
+function savePeriod(idx) {
+  const user = state.users[state.currentUser];
+  const s = document.getElementById('prdStart').value;
+  const e = document.getElementById('prdEnd').value;
+  const mode = window._editingPeriod.mode;
+  const manualDays = parseInt(document.getElementById('prdManualDays').value) || 0;
+  const note = document.getElementById('prdNote').value.trim();
+  
+  if (!s || !e) { toast('Indica ambas fechas', 'error'); return; }
+  if (new Date(e) < new Date(s)) { toast('Fecha fin debe ser posterior', 'error'); return; }
+  if (mode === 'manual' && manualDays <= 0) { toast('Indica días trabajados', 'error'); return; }
+  
+  const p = { startDate: s, endDate: e, mode, manualDays: mode === 'manual' ? manualDays : null, note: note || null };
+  
+  if (!user.tenure.periods) user.tenure.periods = [];
+  if (idx !== null && idx !== undefined) {
+    user.tenure.periods[idx] = p;
+  } else {
+    user.tenure.periods.push(p);
+  }
+  // Sort by start date
+  user.tenure.periods.sort((a,b) => (a.startDate || '').localeCompare(b.startDate || ''));
+  saveUser(state.currentUser);
+  closeModal();
+  renderTenure();
+  toast('Guardado', 'success');
+}
+
 function openMonthlyCheck(targetMonth) {
   const user = state.users[state.currentUser];
-  // Default to previous month
   const now = new Date();
   let year, month;
   if (targetMonth) {
@@ -1421,11 +2202,21 @@ function openMonthlyCheck(targetMonth) {
   // List worked days in that month
   const workedDays = [];
   for (const [key, val] of Object.entries(user.days)) {
-    if (!val.shiftId) continue;
+    const shifts = getDayShifts(val);
+    if (!shifts.length) continue;
     if (!key.startsWith(monthKey)) continue;
-    const shift = user.shifts.find(s => s.id === val.shiftId);
-    if (!shift || shift.hours <= 0) continue;
-    workedDays.push({ key, shift, hours: val.hours });
+    // Use first worked shift (with hours > 0)
+    let workedShift = null;
+    let totalHours = 0;
+    for (const ds of shifts) {
+      const sh = user.shifts.find(s => s.id === ds.shiftId);
+      if (sh && sh.hours > 0) {
+        if (!workedShift) workedShift = sh;
+        totalHours += ds.hours || 0;
+      }
+    }
+    if (!workedShift) continue;
+    workedDays.push({ key, shift: workedShift, hours: totalHours });
   }
   
   let html = `<div class="muted" style="margin-bottom:10px;">${MONTHS[month]} ${year}: marca los días en los que <strong>no</strong> estabas de alta.</div>`;
@@ -1500,10 +2291,13 @@ function renderVacations() {
   const ldShifts = user.shifts.filter(s => s.code === 'LD' || s.name.toLowerCase().includes('libre disp'));
   
   for (const [key, val] of Object.entries(user.days)) {
-    if (!val.shiftId) continue;
+    const shifts = getDayShifts(val);
+    if (!shifts.length) continue;
     if (new Date(key + 'T00:00:00').getFullYear() !== currentYear) continue;
-    if (vacShifts.some(s => s.id === val.shiftId)) usedVac++;
-    if (ldShifts.some(s => s.id === val.shiftId)) usedLD++;
+    for (const ds of shifts) {
+      if (vacShifts.some(s => s.id === ds.shiftId)) usedVac++;
+      if (ldShifts.some(s => s.id === ds.shiftId)) usedLD++;
+    }
   }
   
   const content = document.getElementById('vacationsContent');
@@ -1600,6 +2394,7 @@ function openSettings() {
   const currentTheme = localStorage.getItem(STORAGE_KEY_THEME) || 'dark';
   const notifTime = localStorage.getItem(STORAGE_KEY_NOTIF_TIME) || '20:00';
   const notifEnabled = ('Notification' in window) && Notification.permission === 'granted';
+  const pinEnabled = state.appConfig?.pinEnabled && state.appConfig?.pinHash;
   
   openModal('Ajustes', `
     <div class="settings-section" style="margin:0 0 12px;">
@@ -1610,6 +2405,23 @@ function openSettings() {
         </div>
         <div class="settings-row-value">${currentTheme === 'dark' ? 'Oscuro' : 'Claro'}</div>
       </div>
+    </div>
+    
+    <div class="settings-section" style="margin:0 0 12px;">
+      <div class="settings-row" onclick="${pinEnabled ? 'changePin()' : 'setupPin()'}">
+        <div>
+          <div class="settings-row-title">🔒 PIN de bloqueo</div>
+          <div class="settings-row-desc">${pinEnabled ? 'Activado · pulsa para cambiar' : 'Pulsa para activar'}</div>
+        </div>
+        <div class="settings-row-value">›</div>
+      </div>
+      ${pinEnabled ? `
+      <div class="settings-row" onclick="disablePin()">
+        <div><div class="settings-row-title">Desactivar PIN</div></div>
+      </div>
+      <div class="settings-row" onclick="lockNow()">
+        <div><div class="settings-row-title">🔐 Bloquear ahora</div><div class="settings-row-desc">Pedir PIN inmediatamente</div></div>
+      </div>` : ''}
     </div>
     
     <div class="settings-section" style="margin:0 0 12px;">
@@ -1699,7 +2511,7 @@ function resetAllData() {
 }
 
 function exportAllData() {
-  const data = { users: state.users, events: state.events, exportedAt: new Date().toISOString() };
+  const data = { users: state.users, events: state.events, appConfig: state.appConfig, exportedAt: new Date().toISOString() };
   const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -1755,17 +2567,23 @@ function exportStatsPDF() {
   const counts = {};
   let totalDays = 0, totalHours = 0;
   for (const [key, val] of Object.entries(user.days)) {
-    if (!val.shiftId) continue;
+    const shifts = getDayShifts(val);
+    if (!shifts.length) continue;
     const d = new Date(key + 'T00:00:00');
     if (isMonth) {
       if (d.getFullYear() !== state.statsYear || d.getMonth() !== state.statsMonth) continue;
     } else {
       if (d.getFullYear() !== state.statsYear) continue;
     }
-    counts[val.shiftId] = counts[val.shiftId] || { days: 0, hours: 0 };
-    counts[val.shiftId].days++;
-    counts[val.shiftId].hours += val.hours || 0;
-    totalDays++; totalHours += val.hours || 0;
+    let dayHasWork = false;
+    for (const ds of shifts) {
+      counts[ds.shiftId] = counts[ds.shiftId] || { days: 0, hours: 0 };
+      counts[ds.shiftId].days++;
+      counts[ds.shiftId].hours += ds.hours || 0;
+      totalHours += ds.hours || 0;
+      dayHasWork = true;
+    }
+    if (dayHasWork) totalDays++;
   }
   
   doc.setFontSize(11);
@@ -1790,22 +2608,27 @@ function exportStatsExcel() {
   const isMonth = state.statsMode === 'month';
   const period = isMonth ? `${MONTHS[state.statsMonth]}_${state.statsYear}` : `${state.statsYear}`;
   
-  const rows = [['Fecha', 'Día semana', 'Turno', 'Nombre', 'Horas', 'Nota']];
+  const rows = [['Fecha', 'Día semana', 'Turnos', 'Horas total', 'Nota']];
   const days = Object.entries(user.days).sort();
   for (const [key, val] of days) {
+    const shifts = getDayShifts(val);
+    if (!shifts.length) continue;
     const d = new Date(key + 'T00:00:00');
     if (isMonth) {
       if (d.getFullYear() !== state.statsYear || d.getMonth() !== state.statsMonth) continue;
     } else {
       if (d.getFullYear() !== state.statsYear) continue;
     }
-    const shift = user.shifts.find(s => s.id === val.shiftId);
+    const shiftLabels = shifts.map(ds => {
+      const sh = user.shifts.find(s => s.id === ds.shiftId);
+      return sh ? `${sh.code} (${ds.hours}h)` : '';
+    }).filter(Boolean).join(' + ');
+    const totalH = shifts.reduce((sum, ds) => sum + (ds.hours || 0), 0);
     rows.push([
       key,
       d.toLocaleDateString('es-ES', { weekday: 'long' }),
-      shift?.code || '',
-      shift?.name || '',
-      val.hours || 0,
+      shiftLabels,
+      totalH,
       user.notes[key] || ''
     ]);
   }
@@ -1818,16 +2641,19 @@ function exportStatsExcel() {
   const sumRows = [['Turno', 'Nombre', 'Días', 'Horas']];
   const counts = {};
   for (const [key, val] of Object.entries(user.days)) {
-    if (!val.shiftId) continue;
+    const shifts = getDayShifts(val);
+    if (!shifts.length) continue;
     const d = new Date(key + 'T00:00:00');
     if (isMonth) {
       if (d.getFullYear() !== state.statsYear || d.getMonth() !== state.statsMonth) continue;
     } else {
       if (d.getFullYear() !== state.statsYear) continue;
     }
-    counts[val.shiftId] = counts[val.shiftId] || { days: 0, hours: 0 };
-    counts[val.shiftId].days++;
-    counts[val.shiftId].hours += val.hours || 0;
+    for (const ds of shifts) {
+      counts[ds.shiftId] = counts[ds.shiftId] || { days: 0, hours: 0 };
+      counts[ds.shiftId].days++;
+      counts[ds.shiftId].hours += ds.hours || 0;
+    }
   }
   user.shifts.forEach(s => {
     const c = counts[s.id];
