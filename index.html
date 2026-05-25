@@ -1117,6 +1117,12 @@ textarea.input-field {
   50% { opacity: 0.4; }
 }
 
+@keyframes shake {
+  0%, 100% { transform: translateX(0); }
+  20%, 60% { transform: translateX(-8px); }
+  40%, 80% { transform: translateX(8px); }
+}
+
 /* Color picker grid */
 .color-grid {
   display: grid;
@@ -1181,6 +1187,9 @@ input[type="date"], input[type="time"], input[type="month"] {
 </style>
 </head>
 <body>
+
+<!-- PIN Screen -->
+<div id="pinScreen" style="display:none;position:fixed;inset:0;background:var(--bg);z-index:90;flex-direction:column;align-items:center;justify-content:center;padding:24px;"></div>
 
 <!-- Setup Screen (Firebase config) -->
 <div class="setup-screen" id="setupScreen">
