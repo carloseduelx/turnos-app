@@ -1549,15 +1549,45 @@ function renderPayrolls() {
   const sorted = all.sort((a,b) => (b.year - a.year) || (b.month - a.month));
   const byYear = {};
   sorted.forEach(p => {
-    if (!byYear[p.year]) byYear[p.year] = [];
-    byYear[p.year].push(p);
+    if (!byYear[p.year]) byYear[p.year] = {};
+    if (!byYear[p.year][p.month]) byYear[p.year][p.month] = [];
+    byYear[p.year][p.month].push(p);
   });
   
   for (const year of Object.keys(byYear).sort((a,b) => b-a)) {
     const yh = document.createElement('div');
     yh.innerHTML = `<div class="section-title" style="margin:16px 0 8px;">${year}</div>`;
     list.appendChild(yh);
-    byYear[year].forEach(p => list.appendChild(buildPayrollEl(p)));
+    
+    // Iterate months in descending order
+    const months = Object.keys(byYear[year]).map(Number).sort((a,b) => b-a);
+    for (const m of months) {
+      const monthItems = byYear[year][m];
+      // If multiple payrolls in this month, show a month total header
+      if (monthItems.length > 1) {
+        const mGross = monthItems.reduce((sum, p) => sum + (parseFloat(p.gross) || 0), 0);
+        const mNet = monthItems.reduce((sum, p) => sum + (parseFloat(p.net) || 0), 0);
+        const mWith = monthItems.reduce((sum, p) => sum + (parseFloat(p.withheld) || 0), 0);
+        const monthHeader = document.createElement('div');
+        monthHeader.className = 'payroll-item';
+        monthHeader.style.cssText = 'background:var(--panel-2);border:1px solid var(--accent);';
+        monthHeader.innerHTML = `
+          <div class="payroll-header" style="margin-bottom:6px;">
+            <div>
+              <div class="payroll-month" style="color:var(--accent-2);">📊 Total ${MONTHS[m]}</div>
+              <div class="muted" style="font-size:11px;margin-top:2px;">${monthItems.length} nóminas acumuladas</div>
+            </div>
+          </div>
+          <div class="payroll-amounts">
+            <div class="payroll-amount"><div class="v">${formatMoney(mGross)}</div><div class="l">Bruto</div></div>
+            <div class="payroll-amount"><div class="v">${formatMoney(mNet)}</div><div class="l">Neto</div></div>
+            <div class="payroll-amount"><div class="v">${formatMoney(mWith)}</div><div class="l">Retenido</div></div>
+          </div>
+        `;
+        list.appendChild(monthHeader);
+      }
+      monthItems.forEach(p => list.appendChild(buildPayrollEl(p)));
+    }
   }
 }
 
@@ -1932,6 +1962,7 @@ function renderTenure() {
   // Days from app (worked days with hours > 0)
   let workedDaysFromApp = 0;
   const startDate = t.startDate ? new Date(t.startDate + 'T00:00:00') : null;
+  const endDate = t.endDate ? new Date(t.endDate + 'T00:00:00') : null;
   
   for (const [key, val] of Object.entries(user.days)) {
     const shifts = getDayShifts(val);
@@ -1944,6 +1975,7 @@ function renderTenure() {
     if (!hasWorkedShift) continue;
     const d = new Date(key + 'T00:00:00');
     if (startDate && d < startDate) continue;
+    if (endDate && d > endDate) continue;
     if (d > today) continue;
     // Apply monthly check
     const monthKey = key.slice(0, 7);
@@ -2012,7 +2044,7 @@ function renderTenure() {
       <div class="settings-row" onclick="openTenureSetup()">
         <div>
           <div class="settings-row-title">Configuración general</div>
-          <div class="settings-row-desc">Fecha inicio en la app</div>
+          <div class="settings-row-desc">Contrato actual: inicio y fin</div>
         </div>
         <div class="settings-row-value">›</div>
       </div>
@@ -2036,7 +2068,7 @@ function renderTenure() {
     
     <div style="padding:8px 16px 16px;">
       <div class="muted" style="font-size:11px;text-align:center;line-height:1.6;">
-        ${startDate ? `Uso de la app desde: ${startDate.toLocaleDateString('es-ES')}<br>` : ''}
+        ${startDate ? `Contrato actual: ${startDate.toLocaleDateString('es-ES')}${endDate ? ' → ' + endDate.toLocaleDateString('es-ES') : ' (sin fin)'}<br>` : ''}
         ${periodsDays ? `${periodsDays} días de periodos previos<br>` : ''}
         ${t.manualDaysBefore ? `${t.manualDaysBefore} días manuales extra<br>` : ''}
         ${workedDaysFromApp} días trabajados en la app
@@ -2049,9 +2081,13 @@ function openTenureSetup() {
   const user = state.users[state.currentUser];
   const t = user.tenure || {};
   openModal('Configuración antigüedad', `
-    <label class="input-label">Fecha de inicio usando esta app</label>
+    <label class="input-label">Fecha de inicio del contrato actual</label>
     <input type="date" class="input-field" id="tenStart" value="${t.startDate || ''}">
-    <p class="muted" style="font-size:12px;margin-top:6px;">Desde esta fecha contarán los turnos registrados como días trabajados.</p>
+    <p class="muted" style="font-size:12px;margin-top:6px;">Desde esta fecha contarán los turnos registrados en la app.</p>
+    
+    <label class="input-label mt-12">Fecha de fin (opcional, si es contrato temporal)</label>
+    <input type="date" class="input-field" id="tenEnd" value="${t.endDate || ''}">
+    <p class="muted" style="font-size:12px;margin-top:6px;">Solo contarán los turnos registrados hasta esta fecha. Déjalo vacío si tu contrato no tiene fin previsto.</p>
     
     <label class="input-label mt-12">Días manuales extra (opcional)</label>
     <input type="number" class="input-field" id="tenManual" value="${t.manualDaysBefore || 0}" min="0">
@@ -2060,8 +2096,14 @@ function openTenureSetup() {
     { text: 'Cancelar', class: 'btn-secondary', onClick: closeModal },
     { text: 'Guardar', onClick: () => {
       const start = document.getElementById('tenStart').value;
+      const end = document.getElementById('tenEnd').value;
       const manual = parseInt(document.getElementById('tenManual').value) || 0;
+      if (start && end && new Date(end) < new Date(start)) {
+        toast('La fecha fin debe ser posterior al inicio', 'error');
+        return;
+      }
       user.tenure.startDate = start || null;
+      user.tenure.endDate = end || null;
       user.tenure.manualDaysBefore = manual;
       if (!user.tenure.periods) user.tenure.periods = [];
       saveUser(state.currentUser);
