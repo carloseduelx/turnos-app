@@ -1685,14 +1685,15 @@ async function tryReadPdfAmounts() {
       fullText += tc.items.map(it => it.str).join(' ') + ' ';
     }
     
-    // Try Generalitat Valenciana style first (your PDF format)
+    // Save text for diagnostic mode
+    window._lastPdfText = fullText;
+    
     const result = extractPayrollNumbers(fullText, allItems);
     
     if (result.gross != null) document.getElementById('payGross').value = result.gross.toFixed(2);
     if (result.net != null) document.getElementById('payNet').value = result.net.toFixed(2);
     if (result.withheld != null) document.getElementById('payWith').value = result.withheld.toFixed(2);
     
-    // Also try to detect month/year
     if (result.detectedMonth != null) {
       document.getElementById('payMonth').value = result.detectedMonth;
     }
@@ -1706,14 +1707,91 @@ async function tryReadPdfAmounts() {
     if (result.withheld != null) found.push('Retenido');
     if (result.detectedMonth != null || result.detectedYear != null) found.push('Fecha');
     
-    if (found.length) {
-      toast(`Leídos: ${found.join(', ')}. Revisa antes de guardar.`, 'success');
+    if (found.length === 4) {
+      toast(`✓ Todo leído correctamente. Revisa antes de guardar.`, 'success');
+    } else if (found.length) {
+      toast(`Leídos: ${found.join(', ')}. Si falta algo, pulsa "Ver números detectados".`, 'success');
+      showDiagnosticButton();
     } else {
-      toast('No se han podido extraer importes. Introdúcelos a mano.', 'error');
+      toast('No se han extraído importes. Pulsa "Ver números detectados".', 'error');
+      showDiagnosticButton();
     }
   } catch (err) {
     console.error(err);
     toast('Error leyendo PDF: ' + err.message, 'error');
+  }
+}
+
+function showDiagnosticButton() {
+  // Add a "Ver números detectados" button below the read button
+  const existing = document.getElementById('diagBtn');
+  if (existing) return;
+  const readBtn = document.querySelector('button[onclick="tryReadPdfAmounts()"]');
+  if (!readBtn) return;
+  const btn = document.createElement('button');
+  btn.id = 'diagBtn';
+  btn.className = 'btn btn-secondary btn-sm btn-block mt-8';
+  btn.textContent = '🔍 Ver números detectados';
+  btn.onclick = openDiagnostic;
+  readBtn.parentNode.insertBefore(btn, readBtn.nextSibling);
+}
+
+function openDiagnostic() {
+  const text = window._lastPdfText || '';
+  if (!text) { toast('Primero lee un PDF', 'error'); return; }
+  
+  // Extract all numbers
+  const nums = [];
+  const numRe = /([0-9]{1,3}(?:\.[0-9]{3})*,[0-9]{2})/g;
+  let m;
+  while ((m = numRe.exec(text)) !== null) {
+    const n = parseSpanishNumber(m[1]);
+    if (n != null && n > 0 && n < 100000) {
+      // Get surrounding context (40 chars before)
+      const start = Math.max(0, m.index - 40);
+      const context = text.substring(start, m.index).trim().replace(/\s+/g, ' ');
+      nums.push({ value: n, formatted: m[1], context: context.slice(-35) });
+    }
+  }
+  
+  // Deduplicate but keep distinct contexts
+  const unique = [];
+  const seen = new Map();
+  nums.forEach(n => {
+    if (!seen.has(n.value)) { seen.set(n.value, true); unique.push(n); }
+  });
+  
+  // Sort descending
+  unique.sort((a,b) => b.value - a.value);
+  
+  let html = '<p class="muted" style="margin-top:0;font-size:13px;">Pulsa un número para asignarlo al campo correcto:</p>';
+  html += '<div style="max-height:300px;overflow-y:auto;">';
+  unique.forEach(n => {
+    html += `
+      <div style="display:flex;align-items:center;gap:8px;padding:8px;border-bottom:1px solid var(--border);">
+        <div style="flex:1;">
+          <div style="font-weight:700;font-family:'JetBrains Mono',monospace;font-size:15px;">${n.formatted} €</div>
+          <div class="muted" style="font-size:11px;">${escapeHtml(n.context)}</div>
+        </div>
+        <div style="display:flex;gap:4px;flex-direction:column;">
+          <button class="btn btn-sm" style="padding:4px 8px;font-size:11px;" onclick="assignDiag(${n.value}, 'gross')">Bruto</button>
+          <button class="btn btn-sm" style="padding:4px 8px;font-size:11px;background:var(--info);" onclick="assignDiag(${n.value}, 'net')">Neto</button>
+          <button class="btn btn-sm" style="padding:4px 8px;font-size:11px;background:var(--warning);color:#000;" onclick="assignDiag(${n.value}, 'withheld')">Retenido</button>
+        </div>
+      </div>
+    `;
+  });
+  html += '</div>';
+  
+  openModal('Números detectados en el PDF', html, [{ text: 'Cerrar', class: 'btn-secondary', onClick: closeModal }]);
+}
+
+function assignDiag(value, field) {
+  const fieldMap = { gross: 'payGross', net: 'payNet', withheld: 'payWith' };
+  const el = document.getElementById(fieldMap[field]);
+  if (el) {
+    el.value = value.toFixed(2);
+    toast(`Asignado ${value.toFixed(2)}€ a ${field === 'gross' ? 'Bruto' : field === 'net' ? 'Neto' : 'Retenido'}`, 'success');
   }
 }
 
@@ -1741,57 +1819,79 @@ function extractPayrollNumbers(text, items) {
     }
   }
   
-  // === Strategy: Use the line items to compute totals (most reliable) ===
-  // Generalitat Valenciana format: each line "<código> <CONCEPTO> <importe>"
-  // Códigos 1-89 = devengos (gross), 90+ = deducciones
-  let sumDevengos = 0;
-  let sumDeducciones = 0;
-  const lineRe = /(?:^|\n)\s*(\d{1,3})\s+([A-ZÁÉÍÓÚÑa-záéíóúñ\.\s/]+?)\s+([0-9]{1,3}(?:\.[0-9]{3})*,[0-9]{2})(?=\s|$|\n)/g;
-  let m;
-  while ((m = lineRe.exec(text)) !== null) {
-    const code = parseInt(m[1]);
-    const concept = m[2].trim().toLowerCase();
-    const amount = parseSpanishNumber(m[3]);
-    if (amount == null || amount > 100000) continue;
-    const isDeduction = code >= 90 || /retenci|irpf|contingenci|formaci[oó]n|cuota|seguridad social|desempleo/.test(concept);
-    if (isDeduction) {
-      sumDeducciones += amount;
-    } else {
-      sumDevengos += amount;
+  // === Strategy A: Read directly from "TOTALS / Totales" and "LIQUID / Líquido" ===
+  // Most reliable for Generalitat Valenciana format
+  // After these labels, the next 2 numbers are gross and total deductions
+  // After LIQUID, the next number is the net amount
+  
+  // Find position of "TOTALS / Totales" or "Totals" or "Totales"
+  const totalsIdx = text.search(/TOTALS?\s*\/?\s*Totales/i);
+  if (totalsIdx >= 0) {
+    // Get the next 400 chars and find all numbers
+    const after = text.substring(totalsIdx, totalsIdx + 500);
+    const nums = [];
+    const numRe = /([0-9]{1,3}(?:\.[0-9]{3})*,[0-9]{2})/g;
+    let m;
+    while ((m = numRe.exec(after)) !== null) {
+      const n = parseSpanishNumber(m[1]);
+      if (n != null && n > 0) nums.push(n);
+    }
+    // First 2 should be gross and total deductions
+    if (nums.length >= 2) {
+      // The larger of first two = gross, smaller = total deductions
+      const a = nums[0], b = nums[1];
+      if (a > b) { result.gross = a; result.withheld = b; }
+      else { result.gross = b; result.withheld = a; }
     }
   }
   
-  if (sumDevengos > 0) result.gross = Math.round(sumDevengos * 100) / 100;
-  if (sumDeducciones > 0) result.withheld = Math.round(sumDeducciones * 100) / 100;
-  if (result.gross != null && result.withheld != null) {
-    result.net = Math.round((result.gross - result.withheld) * 100) / 100;
+  // Find LIQUID / Líquido for net
+  const liquidIdx = text.search(/(?:LIQUID|L[ÍI]QUIDO)\s*\/?\s*L[ií]quido/i);
+  if (liquidIdx >= 0) {
+    const after = text.substring(liquidIdx, liquidIdx + 500);
+    const nums = [];
+    const numRe = /([0-9]{1,3}(?:\.[0-9]{3})*,[0-9]{2})/g;
+    let m;
+    while ((m = numRe.exec(after)) !== null) {
+      const n = parseSpanishNumber(m[1]);
+      if (n != null && n > 0) nums.push(n);
+    }
+    // The net is one of these numbers - if we have gross+withheld, find the match
+    if (result.gross != null && result.withheld != null) {
+      const computedNet = Math.round((result.gross - result.withheld) * 100) / 100;
+      const found = nums.find(n => Math.abs(n - computedNet) < 0.1);
+      result.net = found != null ? found : computedNet;
+    } else if (nums.length > 0) {
+      // Without gross/withheld, just take the first reasonable number
+      result.net = nums[0];
+    }
   }
   
-  // === Fallback: read directly from TOTALS / Totales line if line items didn't work ===
+  // === Strategy B: Fallback - sum line items if Strategy A failed ===
   if (result.gross == null || result.withheld == null) {
-    // Pattern: "TOTALS / Totales: 1.592,00 328,94" (may be on same or different lines)
-    const totalsMatch = text.match(/TOTALS?\s*\/?\s*Totales[\s:\n]*([0-9]{1,3}(?:\.[0-9]{3})*,[0-9]{2})[\s\n]+([0-9]{1,3}(?:\.[0-9]{3})*,[0-9]{2})/i);
-    if (totalsMatch) {
-      const a = parseSpanishNumber(totalsMatch[1]);
-      const b = parseSpanishNumber(totalsMatch[2]);
-      if (a != null && b != null) {
-        // The larger is gross, the smaller is total deductions
-        if (a > b) {
-          if (result.gross == null) result.gross = a;
-          if (result.withheld == null) result.withheld = b;
-        } else {
-          if (result.gross == null) result.gross = b;
-          if (result.withheld == null) result.withheld = a;
-        }
-      }
+    let sumDevengos = 0;
+    let sumDeducciones = 0;
+    // More permissive: match "<code> <CONCEPT> <amount>" anywhere
+    const lineRe = /(\d{1,3})\s+([A-ZÁÉÍÓÚÑa-záéíóúñ\.\s/]{3,60}?)\s+([0-9]{1,3}(?:\.[0-9]{3})*,[0-9]{2})/g;
+    let m;
+    const seen = new Set();
+    while ((m = lineRe.exec(text)) !== null) {
+      const code = parseInt(m[1]);
+      const concept = m[2].trim().toLowerCase();
+      const amount = parseSpanishNumber(m[3]);
+      if (amount == null || amount > 100000 || amount <= 0) continue;
+      // Avoid duplicates (code+amount)
+      const key = `${code}_${amount}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const isDeduction = code >= 90 || /retenci|irpf|contingenci|formaci[oó]n|cuota.*seg|seguridad social|desempleo/.test(concept);
+      if (isDeduction) sumDeducciones += amount;
+      else sumDevengos += amount;
     }
-  }
-  
-  // === Fallback for net: try to read directly from LIQUID / Líquido line ===
-  if (result.net == null) {
-    const liquidMatch = text.match(/(?:LIQUID|L[ÍI]QUIDO)\s*\/?\s*L[ií]quido[\s:\n]*([0-9]{1,3}(?:\.[0-9]{3})*,[0-9]{2})/i);
-    if (liquidMatch) {
-      result.net = parseSpanishNumber(liquidMatch[1]);
+    if (result.gross == null && sumDevengos > 0) result.gross = Math.round(sumDevengos * 100) / 100;
+    if (result.withheld == null && sumDeducciones > 0) result.withheld = Math.round(sumDeducciones * 100) / 100;
+    if (result.net == null && result.gross != null && result.withheld != null) {
+      result.net = Math.round((result.gross - result.withheld) * 100) / 100;
     }
   }
   
