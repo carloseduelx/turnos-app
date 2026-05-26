@@ -1728,105 +1728,7 @@ function parseSpanishNumber(s) {
 function extractPayrollNumbers(text, items) {
   const result = { gross: null, net: null, withheld: null, detectedMonth: null, detectedYear: null };
   
-  // Number regex (Spanish format: thousands with . and decimals with ,)
-  const numRe = /([0-9]{1,3}(?:\.[0-9]{3})*,[0-9]{2})/g;
-  
-  // === Strategy 1: For Generalitat Valenciana style nóminas ===
-  // The structure has line items like "1 SUELDO 749,58", "98 RETENCION IRPF 237,05"
-  // Devengos = sum of items in left column (codes 1-50 typically)
-  // Deducciones = items in right column (codes 90-110 typically)
-  
-  // Try to find the IRPF withholding amount (specific line)
-  const irpfLineMatch = text.match(/(?:\d+\s+)?RETENCI[OÓ]N\s+IRPF\s+([0-9]{1,3}(?:\.[0-9]{3})*,[0-9]{2})/i);
-  if (irpfLineMatch) {
-    result.withheld = parseSpanishNumber(irpfLineMatch[1]);
-  }
-  
-  // Find "TOTALS / Totales" followed by two numbers (gross, total deductions)
-  // Note: the labels and numbers may be separated in the text extraction
-  const totalsBlock = text.match(/TOTALS?\s*\/?\s*Totales[\s\S]{0,200}?([0-9]{1,3}(?:\.[0-9]{3})*,[0-9]{2})\s*([0-9]{1,3}(?:\.[0-9]{3})*,[0-9]{2})/i);
-  if (totalsBlock) {
-    // In Generalitat format: deductions appear first, then devengos (gross)
-    // Try both orders
-    const a = parseSpanishNumber(totalsBlock[1]);
-    const b = parseSpanishNumber(totalsBlock[2]);
-    if (a != null && b != null) {
-      // Usually larger = gross, smaller = deductions
-      if (b > a) {
-        result.gross = b;
-        // If we don't have withheld yet and total deductions equals IRPF (rare)
-        // we still trust the irpfLineMatch above
-      } else {
-        result.gross = a;
-      }
-    }
-  }
-  
-  // Calculate net = gross - total deductions if possible
-  // First find total deductions
-  if (result.gross == null) {
-    // Fallback: sum all numbers preceded by code numbers 1-89 (devengos)
-    let sumDevengos = 0;
-    const lineRe = /(?:^|\n)\s*(\d{1,3})\s+([A-ZÁÉÍÓÚÑa-záéíóúñ\.\s/]+?)\s+([0-9]{1,3}(?:\.[0-9]{3})*,[0-9]{2})/g;
-    let m;
-    while ((m = lineRe.exec(text)) !== null) {
-      const code = parseInt(m[1]);
-      const concept = m[2].trim().toLowerCase();
-      const amount = parseSpanishNumber(m[3]);
-      // Codes 1-89 are typically devengos, 90+ are deducciones
-      // But also detect by concept: "retencion", "irpf", "contingencias", "formacion" = deduction
-      const isDeduction = code >= 90 || /retenci|irpf|contingenci|formaci[oó]n|cuota|seguridad social/.test(concept);
-      if (!isDeduction && amount != null && amount < 50000) {
-        sumDevengos += amount;
-      }
-    }
-    if (sumDevengos > 0) result.gross = Math.round(sumDevengos * 100) / 100;
-  }
-  
-  // Try to find net (LIQUID / Líquido)
-  // The number after LIQUID is normally the net amount
-  // Try matching after the "LIQUID / Líquido:" label
-  const liquidBlock = text.match(/(?:LIQUID|L[ÍI]QUIDO)\s*\/?\s*L[ií]quido[\s\S]{0,300}?([0-9]{1,3}(?:\.[0-9]{3})*,[0-9]{2})/i);
-  if (liquidBlock) {
-    // In Generalitat format, the net comes much later among other numbers
-    // Let's instead try: extract ALL numbers after "LIQUID" and pick the one that matches gross - deductions
-    const afterLiquid = text.substring(text.search(/LIQUID|L[ÍI]QUIDO/i));
-    const nums = [];
-    let nm;
-    const allNumRe = /([0-9]{1,3}(?:\.[0-9]{3})*,[0-9]{2})/g;
-    while ((nm = allNumRe.exec(afterLiquid)) !== null) {
-      const n = parseSpanishNumber(nm[1]);
-      if (n != null && n > 0) nums.push(n);
-    }
-    
-    // Calculate deductions total (sum of items with code 90+)
-    let sumDed = 0;
-    const lineRe2 = /(?:^|\n)\s*(\d{1,3})\s+([A-ZÁÉÍÓÚÑa-záéíóúñ\.\s/]+?)\s+([0-9]{1,3}(?:\.[0-9]{3})*,[0-9]{2})/g;
-    let lm;
-    while ((lm = lineRe2.exec(text)) !== null) {
-      const code = parseInt(lm[1]);
-      const concept = lm[2].trim().toLowerCase();
-      const amount = parseSpanishNumber(lm[3]);
-      const isDed = code >= 90 || /retenci|irpf|contingenci|formaci[oó]n/.test(concept);
-      if (isDed && amount != null) sumDed += amount;
-    }
-    
-    // Computed net
-    if (result.gross != null && sumDed > 0) {
-      const computedNet = Math.round((result.gross - sumDed) * 100) / 100;
-      // Look for this number in the nums array (with small tolerance)
-      const found = nums.find(n => Math.abs(n - computedNet) < 0.1);
-      if (found != null) result.net = found;
-      else if (computedNet > 0) result.net = computedNet; // use computed
-    }
-    
-    // Fallback: take first number after LIQUID that's not the gross or deductions
-    if (result.net == null && liquidBlock[1]) {
-      result.net = parseSpanishNumber(liquidBlock[1]);
-    }
-  }
-  
-  // === Period detection: "04/2026 - Normal" or "01/04/2026 - 30/04/2026" ===
+  // === Period detection ===
   const periodMatch = text.match(/(\d{2})\/(\d{4})\s*-?\s*Normal/i);
   if (periodMatch) {
     result.detectedMonth = parseInt(periodMatch[1]) - 1;
@@ -1836,6 +1738,60 @@ function extractPayrollNumbers(text, items) {
     if (rangeMatch) {
       result.detectedMonth = parseInt(rangeMatch[1]) - 1;
       result.detectedYear = parseInt(rangeMatch[2]);
+    }
+  }
+  
+  // === Strategy: Use the line items to compute totals (most reliable) ===
+  // Generalitat Valenciana format: each line "<código> <CONCEPTO> <importe>"
+  // Códigos 1-89 = devengos (gross), 90+ = deducciones
+  let sumDevengos = 0;
+  let sumDeducciones = 0;
+  const lineRe = /(?:^|\n)\s*(\d{1,3})\s+([A-ZÁÉÍÓÚÑa-záéíóúñ\.\s/]+?)\s+([0-9]{1,3}(?:\.[0-9]{3})*,[0-9]{2})(?=\s|$|\n)/g;
+  let m;
+  while ((m = lineRe.exec(text)) !== null) {
+    const code = parseInt(m[1]);
+    const concept = m[2].trim().toLowerCase();
+    const amount = parseSpanishNumber(m[3]);
+    if (amount == null || amount > 100000) continue;
+    const isDeduction = code >= 90 || /retenci|irpf|contingenci|formaci[oó]n|cuota|seguridad social|desempleo/.test(concept);
+    if (isDeduction) {
+      sumDeducciones += amount;
+    } else {
+      sumDevengos += amount;
+    }
+  }
+  
+  if (sumDevengos > 0) result.gross = Math.round(sumDevengos * 100) / 100;
+  if (sumDeducciones > 0) result.withheld = Math.round(sumDeducciones * 100) / 100;
+  if (result.gross != null && result.withheld != null) {
+    result.net = Math.round((result.gross - result.withheld) * 100) / 100;
+  }
+  
+  // === Fallback: read directly from TOTALS / Totales line if line items didn't work ===
+  if (result.gross == null || result.withheld == null) {
+    // Pattern: "TOTALS / Totales: 1.592,00 328,94" (may be on same or different lines)
+    const totalsMatch = text.match(/TOTALS?\s*\/?\s*Totales[\s:\n]*([0-9]{1,3}(?:\.[0-9]{3})*,[0-9]{2})[\s\n]+([0-9]{1,3}(?:\.[0-9]{3})*,[0-9]{2})/i);
+    if (totalsMatch) {
+      const a = parseSpanishNumber(totalsMatch[1]);
+      const b = parseSpanishNumber(totalsMatch[2]);
+      if (a != null && b != null) {
+        // The larger is gross, the smaller is total deductions
+        if (a > b) {
+          if (result.gross == null) result.gross = a;
+          if (result.withheld == null) result.withheld = b;
+        } else {
+          if (result.gross == null) result.gross = b;
+          if (result.withheld == null) result.withheld = a;
+        }
+      }
+    }
+  }
+  
+  // === Fallback for net: try to read directly from LIQUID / Líquido line ===
+  if (result.net == null) {
+    const liquidMatch = text.match(/(?:LIQUID|L[ÍI]QUIDO)\s*\/?\s*L[ií]quido[\s:\n]*([0-9]{1,3}(?:\.[0-9]{3})*,[0-9]{2})/i);
+    if (liquidMatch) {
+      result.net = parseSpanishNumber(liquidMatch[1]);
     }
   }
   
