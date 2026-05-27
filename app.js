@@ -2015,7 +2015,7 @@ function renderTenure() {
     }
   });
   
-  // Days from app (worked days with hours > 0)
+  // Days from app (any day with a shift counts as worked, including 0h shifts like Libre)
   let workedDaysFromApp = 0;
   const startDate = t.startDate ? new Date(t.startDate + 'T00:00:00') : null;
   const endDate = t.endDate ? new Date(t.endDate + 'T00:00:00') : null;
@@ -2023,12 +2023,6 @@ function renderTenure() {
   for (const [key, val] of Object.entries(user.days)) {
     const shifts = getDayShifts(val);
     if (!shifts.length) continue;
-    // Check if any shift counts as worked (hours > 0)
-    const hasWorkedShift = shifts.some(ds => {
-      const sh = user.shifts.find(s => s.id === ds.shiftId);
-      return sh && sh.hours > 0;
-    });
-    if (!hasWorkedShift) continue;
     const d = new Date(key + 'T00:00:00');
     if (startDate && d < startDate) continue;
     if (endDate && d > endDate) continue;
@@ -2300,24 +2294,17 @@ function openMonthlyCheck(targetMonth) {
   const monthKey = `${year}-${String(month+1).padStart(2,'0')}`;
   const check = user.tenure.monthlyChecks?.[monthKey] || { excludedDays: [], confirmed: false };
   
-  // List worked days in that month
+  // List days with any shift in that month (all count for tenure)
   const workedDays = [];
   for (const [key, val] of Object.entries(user.days)) {
     const shifts = getDayShifts(val);
     if (!shifts.length) continue;
     if (!key.startsWith(monthKey)) continue;
-    // Use first worked shift (with hours > 0)
-    let workedShift = null;
-    let totalHours = 0;
-    for (const ds of shifts) {
-      const sh = user.shifts.find(s => s.id === ds.shiftId);
-      if (sh && sh.hours > 0) {
-        if (!workedShift) workedShift = sh;
-        totalHours += ds.hours || 0;
-      }
-    }
-    if (!workedShift) continue;
-    workedDays.push({ key, shift: workedShift, hours: totalHours });
+    // Use first shift for display
+    const firstShift = user.shifts.find(s => s.id === shifts[0].shiftId);
+    if (!firstShift) continue;
+    const totalHours = shifts.reduce((sum, ds) => sum + (ds.hours || 0), 0);
+    workedDays.push({ key, shift: firstShift, hours: totalHours });
   }
   
   let html = `<div class="muted" style="margin-bottom:10px;">${MONTHS[month]} ${year}: marca los días en los que <strong>no</strong> estabas de alta.</div>`;
