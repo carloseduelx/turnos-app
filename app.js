@@ -2004,12 +2004,12 @@ function renderTenure() {
     if (p.mode === 'manual') {
       periodsDays += parseInt(p.manualDays) || 0;
     } else {
-      // Count days between start and end inclusive
+      // Count days between start and end inclusive (DST-safe)
       if (p.startDate && p.endDate) {
-        const s = new Date(p.startDate + 'T00:00:00');
-        const e = new Date(p.endDate + 'T00:00:00');
+        const s = new Date(p.startDate + 'T12:00:00');
+        const e = new Date(p.endDate + 'T12:00:00');
         if (!isNaN(s) && !isNaN(e) && e >= s) {
-          periodsDays += Math.floor((e - s) / (1000 * 60 * 60 * 24)) + 1;
+          periodsDays += Math.round((e - s) / (1000 * 60 * 60 * 24)) + 1;
         }
       }
     }
@@ -2056,9 +2056,9 @@ function renderTenure() {
       if (p.mode === 'manual') {
         pDays = parseInt(p.manualDays) || 0;
       } else if (p.startDate && p.endDate) {
-        const s = new Date(p.startDate + 'T00:00:00');
-        const e = new Date(p.endDate + 'T00:00:00');
-        if (!isNaN(s) && !isNaN(e) && e >= s) pDays = Math.floor((e-s)/(1000*60*60*24)) + 1;
+        const s = new Date(p.startDate + 'T12:00:00');
+        const e = new Date(p.endDate + 'T12:00:00');
+        if (!isNaN(s) && !isNaN(e) && e >= s) pDays = Math.round((e-s)/(1000*60*60*24)) + 1;
       }
       periodsHtml += `
         <div class="event-item" style="margin-bottom:8px;" onclick="editTenurePeriod(${idx})">
@@ -2219,11 +2219,11 @@ function editTenurePeriod(idx) {
       const mode = window._editingPeriod.mode;
       const sEl = document.getElementById('prdSummary');
       if (!s || !e) { sEl.textContent = ''; return; }
-      const sd = new Date(s + 'T00:00:00');
-      const ed = new Date(e + 'T00:00:00');
+      const sd = new Date(s + 'T12:00:00');
+      const ed = new Date(e + 'T12:00:00');
       if (ed < sd) { sEl.textContent = 'La fecha fin debe ser posterior'; sEl.style.color = 'var(--danger)'; return; }
       sEl.style.color = '';
-      const totalRange = Math.floor((ed - sd)/(1000*60*60*24)) + 1;
+      const totalRange = Math.round((ed - sd)/(1000*60*60*24)) + 1;
       if (mode === 'manual') {
         const m = parseInt(document.getElementById('prdManualDays').value) || 0;
         sEl.innerHTML = `Rango de ${totalRange} días naturales · <strong>${m} días</strong> contarán para antigüedad`;
