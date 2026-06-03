@@ -32,6 +32,13 @@ const PIN_MAX_FAILS = 5;
 const PIN_LOCK_MINUTES = 5;
 const PIN_SESSION_MINUTES = 60 * 12; // re-pedir PIN tras 12h de inactividad
 
+// Clave secreta para proteger la base de datos (debe coincidir con las reglas de Firebase)
+const DB_SECRET = '69bb413f8347c76ad8613fb53f8778a7df477b726fca2f11';
+// Helper: antepone la rama segura a cualquier ruta
+function dbPath(path) {
+  return path ? `secure/${DB_SECRET}/${path}` : `secure/${DB_SECRET}`;
+}
+
 // ==========================================================================
 // State
 // ==========================================================================
@@ -102,15 +109,17 @@ function tryConnectFirebase() {
     try { firebaseStorage = firebase.getStorage(firebaseApp); } catch(e) { console.warn('Storage not available', e); }
     firebaseConnected = true;
     
+    // Migración: si hay datos en las rutas antiguas (sin clave) y nada en la nueva, copiarlos
+    migrateOldDataIfNeeded().then(() => {
     // Fetch initial appConfig BEFORE showing app, so we know if PIN is needed
-    firebase.get(firebase.ref(firebaseDb, 'appConfig')).then(snap => {
+    firebase.get(firebase.ref(firebaseDb, dbPath('appConfig'))).then(snap => {
       const val = snap.val();
       if (val) state.appConfig = { ...state.appConfig, ...val };
       // Also fetch users first to have them ready
       return Promise.all([
-        firebase.get(firebase.ref(firebaseDb, 'users/user1')),
-        firebase.get(firebase.ref(firebaseDb, 'users/user2')),
-        firebase.get(firebase.ref(firebaseDb, 'events'))
+        firebase.get(firebase.ref(firebaseDb, dbPath('users/user1'))),
+        firebase.get(firebase.ref(firebaseDb, dbPath('users/user2'))),
+        firebase.get(firebase.ref(firebaseDb, dbPath('events')))
       ]);
     }).then(([u1, u2, ev]) => {
       if (u1.val()) state.users.user1 = { ...state.users.user1, ...u1.val() };
@@ -132,9 +141,40 @@ function tryConnectFirebase() {
       showApp();
       updateSyncDot(true);
     });
+    });
   } catch (err) {
     console.error('Firebase connect error', err);
     toast('Error conectando a Firebase: ' + err.message, 'error');
+  }
+}
+
+// Migra datos de las rutas antiguas (públicas) a la rama segura, una sola vez
+async function migrateOldDataIfNeeded() {
+  try {
+    // ¿Ya hay datos en la rama segura?
+    const secureSnap = await firebase.get(firebase.ref(firebaseDb, dbPath('users/user1')));
+    if (secureSnap.exists()) return; // Ya migrado o ya hay datos nuevos
+    
+    // ¿Hay datos en las rutas antiguas?
+    const [oldU1, oldU2, oldEv, oldCfg] = await Promise.all([
+      firebase.get(firebase.ref(firebaseDb, 'users/user1')),
+      firebase.get(firebase.ref(firebaseDb, 'users/user2')),
+      firebase.get(firebase.ref(firebaseDb, 'events')),
+      firebase.get(firebase.ref(firebaseDb, 'appConfig'))
+    ]);
+    
+    if (!oldU1.exists() && !oldU2.exists() && !oldEv.exists()) return; // No hay nada que migrar
+    
+    // Copiar a la rama segura
+    const writes = [];
+    if (oldU1.exists()) writes.push(firebase.set(firebase.ref(firebaseDb, dbPath('users/user1')), oldU1.val()));
+    if (oldU2.exists()) writes.push(firebase.set(firebase.ref(firebaseDb, dbPath('users/user2')), oldU2.val()));
+    if (oldEv.exists()) writes.push(firebase.set(firebase.ref(firebaseDb, dbPath('events')), oldEv.val()));
+    if (oldCfg.exists()) writes.push(firebase.set(firebase.ref(firebaseDb, dbPath('appConfig')), oldCfg.val()));
+    await Promise.all(writes);
+    console.log('Datos migrados a la rama segura');
+  } catch (err) {
+    console.warn('Migración no completada (puede ser normal si las reglas ya bloquean):', err);
   }
 }
 
@@ -452,7 +492,7 @@ function saveAppConfig() {
     return;
   }
   suppressFirebaseWrite = true;
-  firebase.set(firebase.ref(firebaseDb, 'appConfig'), state.appConfig)
+  firebase.set(firebase.ref(firebaseDb, dbPath('appConfig')), state.appConfig)
     .then(() => { setTimeout(() => suppressFirebaseWrite = false, 200); })
     .catch(err => { console.error(err); toast('Error guardando: ' + err.message, 'error'); suppressFirebaseWrite = false; });
 }
@@ -473,7 +513,7 @@ function setupFirebaseSync() {
   
   // Listen to users
   for (const uid of ['user1', 'user2']) {
-    const r = firebase.ref(firebaseDb, `users/${uid}`);
+    const r = firebase.ref(firebaseDb, dbPath(`users/${uid}`));
     const unsub = firebase.onValue(r, snap => {
       const val = snap.val();
       if (val && !suppressFirebaseWrite) {
@@ -494,7 +534,7 @@ function setupFirebaseSync() {
   }
   
   // Listen to events
-  const eR = firebase.ref(firebaseDb, 'events');
+  const eR = firebase.ref(firebaseDb, dbPath('events'));
   firebase.onValue(eR, snap => {
     const val = snap.val();
     if (!suppressFirebaseWrite) {
@@ -505,7 +545,7 @@ function setupFirebaseSync() {
   });
   
   // Listen to app config (PIN)
-  const cR = firebase.ref(firebaseDb, 'appConfig');
+  const cR = firebase.ref(firebaseDb, dbPath('appConfig'));
   firebase.onValue(cR, snap => {
     const val = snap.val();
     if (val && !suppressFirebaseWrite) {
@@ -542,7 +582,7 @@ function saveUser(uid) {
   localStorage.setItem(STORAGE_KEY_LOCAL, JSON.stringify({ users: state.users, events: state.events, appConfig: state.appConfig }));
   if (!firebaseConnected) return;
   suppressFirebaseWrite = true;
-  firebase.set(firebase.ref(firebaseDb, `users/${uid}`), state.users[uid])
+  firebase.set(firebase.ref(firebaseDb, dbPath(`users/${uid}`)), state.users[uid])
     .then(() => { setTimeout(() => suppressFirebaseWrite = false, 200); })
     .catch(err => { console.error(err); toast('Error guardando: ' + err.message, 'error'); suppressFirebaseWrite = false; });
 }
@@ -551,7 +591,7 @@ function saveEvents() {
   localStorage.setItem(STORAGE_KEY_LOCAL, JSON.stringify({ users: state.users, events: state.events, appConfig: state.appConfig }));
   if (!firebaseConnected) return;
   suppressFirebaseWrite = true;
-  firebase.set(firebase.ref(firebaseDb, 'events'), state.events)
+  firebase.set(firebase.ref(firebaseDb, dbPath('events')), state.events)
     .then(() => { setTimeout(() => suppressFirebaseWrite = false, 200); })
     .catch(err => { console.error(err); toast('Error guardando: ' + err.message, 'error'); suppressFirebaseWrite = false; });
 }
@@ -2593,7 +2633,7 @@ function resetAllData() {
   if (!confirm('¿Estás seguro? Se eliminarán turnos, nóminas, eventos y configuración.')) return;
   localStorage.clear();
   if (firebaseConnected) {
-    firebase.remove(firebase.ref(firebaseDb)).catch(()=>{});
+    firebase.remove(firebase.ref(firebaseDb, dbPath())).catch(()=>{});
   }
   location.reload();
 }
