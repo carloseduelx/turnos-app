@@ -1232,31 +1232,54 @@ function buildEventDayCell(year, month, day, otherMonth) {
   const today = new Date();
   if (date.toDateString() === today.toDateString()) cell.classList.add('today');
   
-  const num = document.createElement('div');
-  num.className = 'cal-day-num';
-  num.textContent = day;
-  cell.appendChild(num);
-  
   // Get events for this day
   const dayEvents = Object.values(state.events).filter(e => e.date === dateKey);
   
+  const num = document.createElement('div');
+  num.className = 'cal-day-num';
+  num.textContent = day;
+  
   if (dayEvents.length) {
-    // Show event title(s) inside the cell
+    // Fill whole cell with blue background
+    cell.style.background = 'var(--info)';
+    num.style.color = '#fff';
+    num.style.cssText += ';position:absolute;top:3px;right:5px;z-index:2;text-shadow:0 1px 2px rgba(0,0,0,0.3);';
+    cell.appendChild(num);
+    
+    // Total lines available = 4, distributed among events
+    const TOTAL_LINES = 4;
+    const n = dayEvents.length;
+    // Base lines per event, distributing remainder to the first events
+    const baseLines = Math.floor(TOTAL_LINES / n);
+    let remainder = TOTAL_LINES % n;
+    
     const evWrap = document.createElement('div');
-    evWrap.style.cssText = 'width:100%;margin-top:3px;display:flex;flex-direction:column;gap:2px;align-items:stretch;overflow:hidden;';
-    dayEvents.slice(0, 2).forEach(ev => {
+    evWrap.style.cssText = 'width:100%;flex:1;display:flex;flex-direction:column;gap:1px;align-items:stretch;overflow:hidden;margin-top:14px;';
+    
+    // If only 1 event: use all 4 lines for its title
+    // If multiple: each gets its share (at least 1 line)
+    const maxEventsToShow = Math.min(n, TOTAL_LINES); // can't show more than 4 events (1 line each)
+    let linesUsed = 0;
+    
+    for (let i = 0; i < maxEventsToShow; i++) {
+      const ev = dayEvents[i];
+      let lines = baseLines;
+      if (remainder > 0) { lines++; remainder--; }
+      if (lines < 1) lines = 1;
+      // Don't exceed total
+      if (linesUsed + lines > TOTAL_LINES) lines = TOTAL_LINES - linesUsed;
+      if (lines < 1) break;
+      linesUsed += lines;
+      
       const evChip = document.createElement('div');
-      evChip.style.cssText = 'background:var(--info);color:#fff;font-size:9px;font-weight:600;padding:2px 4px;border-radius:4px;text-align:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;line-height:1.2;';
-      evChip.textContent = ev.title;
+      evChip.style.cssText = `color:#fff;font-size:9px;font-weight:600;text-align:left;line-height:1.15;overflow:hidden;display:-webkit-box;-webkit-line-clamp:${lines};-webkit-box-orient:vertical;word-break:break-word;${i>0?'border-top:1px solid rgba(255,255,255,0.3);padding-top:1px;':''}`;
+      evChip.textContent = ev.title + (ev.time ? ' · ' + ev.time : '');
       evWrap.appendChild(evChip);
-    });
-    if (dayEvents.length > 2) {
-      const more = document.createElement('div');
-      more.style.cssText = 'font-size:9px;color:var(--text-dim);text-align:center;font-weight:600;';
-      more.textContent = `+${dayEvents.length - 2}`;
-      evWrap.appendChild(more);
     }
+    
     cell.appendChild(evWrap);
+  } else {
+    cell.appendChild(num);
   }
   
   cell.onclick = () => openEventDaySheet(date);
