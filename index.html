@@ -374,6 +374,19 @@ button, input, select, textarea {
 .cal-day:active { transform: scale(0.96); }
 .cal-day.other-month { opacity: 0.3; }
 .cal-day.today { border-color: var(--accent); }
+
+.cal-day-num.today-circle {
+  background: var(--accent);
+  color: #fff !important;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+}
 .cal-day.selected { box-shadow: 0 0 0 2px var(--accent-2); }
 
 .cal-day-num {
@@ -1248,8 +1261,12 @@ input[type="date"], input[type="time"], input[type="month"] {
       <div class="cal-weekday">S</div>
       <div class="cal-weekday">D</div>
     </div>
+    <div id="bothLegend" style="display:none;justify-content:center;gap:18px;padding:6px 16px 0;font-size:12px;color:var(--text-dim);">
+      <span><span style="display:inline-block;width:0;height:0;border-style:solid;border-width:9px 9px 0 0;border-color:var(--accent) transparent transparent transparent;vertical-align:middle;margin-right:5px;"></span><span id="bothLegend1">Persona 1</span></span>
+      <span><span style="display:inline-block;width:0;height:0;border-style:solid;border-width:0 0 9px 9px;border-color:transparent transparent var(--text-dim) transparent;vertical-align:middle;margin-right:5px;"></span><span id="bothLegend2">Persona 2</span></span>
+    </div>
     <div class="cal-grid" id="calGrid"></div>
-    <div style="padding:16px;">
+    <div style="padding:16px;" id="calBottomBtns">
       <div class="btn-row">
         <button class="btn btn-secondary btn-sm" onclick="openPatternModal()">🔄 Patrón automático</button>
         <button class="btn btn-secondary btn-sm" onclick="openLegend()">🎨 Leyenda</button>
