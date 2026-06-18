@@ -627,11 +627,23 @@ function renderUserTabs() {
     btn.addEventListener('touchmove', () => clearTimeout(btn._longPressTimer));
     el.appendChild(btn);
   }
+  // "Ambos" tab (combined view, read-only) - only show on calendar page
+  const bothBtn = document.createElement('button');
+  bothBtn.className = 'user-tab' + (state.currentUser === 'both' ? ' active' : '');
+  bothBtn.textContent = 'Ambos';
+  bothBtn.style.flex = '0 0 auto';
+  bothBtn.style.minWidth = '60px';
+  bothBtn.onclick = () => switchUser('both');
+  el.appendChild(bothBtn);
 }
 
 function switchUser(uid) {
+  // If switching to "both" but not on calendar page, go to calendar
+  if (uid === 'both' && currentPage !== 'calendar') {
+    switchPage('calendar', document.querySelector('.nav-item[data-page="calendar"]'));
+  }
   state.currentUser = uid;
-  localStorage.setItem(STORAGE_KEY_LAST_USER, uid);
+  if (uid !== 'both') localStorage.setItem(STORAGE_KEY_LAST_USER, uid);
   renderUserTabs();
   renderAll();
 }
@@ -657,28 +669,48 @@ function renderCalendar() {
   const grid = document.getElementById('calGrid');
   grid.innerHTML = '';
   
+  const isBoth = state.currentUser === 'both';
+  
+  // Show/hide bottom buttons (pattern/legend) - not useful in combined view
+  const calBtns = document.getElementById('calBottomBtns');
+  if (calBtns) calBtns.style.display = isBoth ? 'none' : '';
+  
+  // Show legend of who's who in combined view
+  const bothLegend = document.getElementById('bothLegend');
+  if (bothLegend) {
+    bothLegend.style.display = isBoth ? 'flex' : 'none';
+    if (isBoth) {
+      const l1 = document.getElementById('bothLegend1');
+      const l2 = document.getElementById('bothLegend2');
+      if (l1) l1.textContent = state.users.user1.name || 'Persona 1';
+      if (l2) l2.textContent = state.users.user2.name || 'Persona 2';
+    }
+  }
+  
   const firstDay = new Date(state.viewYear, state.viewMonth, 1);
   const lastDay = new Date(state.viewYear, state.viewMonth + 1, 0);
   // Monday-based week
   let startWeekday = firstDay.getDay() - 1;
   if (startWeekday < 0) startWeekday = 6;
   
+  const cellFn = isBoth ? buildCombinedDayCell : buildDayCell;
+  
   // Previous month days
   const prevLast = new Date(state.viewYear, state.viewMonth, 0).getDate();
   for (let i = startWeekday - 1; i >= 0; i--) {
-    grid.appendChild(buildDayCell(state.viewYear, state.viewMonth - 1, prevLast - i, true));
+    grid.appendChild(cellFn(state.viewYear, state.viewMonth - 1, prevLast - i, true));
   }
   
   // Current month
   for (let d = 1; d <= lastDay.getDate(); d++) {
-    grid.appendChild(buildDayCell(state.viewYear, state.viewMonth, d, false));
+    grid.appendChild(cellFn(state.viewYear, state.viewMonth, d, false));
   }
   
   // Trailing days
   const totalCells = grid.children.length;
   const cellsNeeded = Math.ceil(totalCells / 7) * 7;
   for (let i = 1; i <= cellsNeeded - totalCells; i++) {
-    grid.appendChild(buildDayCell(state.viewYear, state.viewMonth + 1, i, true));
+    grid.appendChild(cellFn(state.viewYear, state.viewMonth + 1, i, true));
   }
 }
 
@@ -754,7 +786,92 @@ function buildDayCell(year, month, day, otherMonth) {
     cell.appendChild(evDot);
   }
   
+  // Today circle (applied last so it takes priority over shift coloring)
+  if (date.toDateString() === today.toDateString()) {
+    num.classList.add('today-circle');
+    num.style.color = '#fff';
+  }
+  
   cell.onclick = () => openDaySheet(date);
+  return cell;
+}
+
+// Combined view: diagonal split, user1 top-left, user2 bottom-right, read-only
+function buildCombinedDayCell(year, month, day, otherMonth) {
+  const date = new Date(year, month, day);
+  const dateKey = formatDate(date);
+  const cell = document.createElement('div');
+  cell.className = 'cal-day';
+  if (otherMonth) cell.classList.add('other-month');
+  const weekday = date.getDay();
+  if (weekday === 0 || weekday === 6) cell.classList.add('weekend');
+  
+  const today = new Date();
+  if (date.toDateString() === today.toDateString()) cell.classList.add('today');
+  
+  const u1 = state.users.user1;
+  const u2 = state.users.user2;
+  const d1 = getDayShifts(u1.days[dateKey]);
+  const d2 = getDayShifts(u2.days[dateKey]);
+  
+  // Resolve shift objects
+  const sh1 = d1.map(ds => u1.shifts.find(s => s.id === ds.shiftId)).filter(Boolean);
+  const sh2 = d2.map(ds => u2.shifts.find(s => s.id === ds.shiftId)).filter(Boolean);
+  
+  // Colors for each half (use first shift's color; if empty, transparent)
+  const c1 = sh1.length ? sh1[0].color : 'transparent';
+  const c2 = sh2.length ? sh2[0].color : 'transparent';
+  
+  // Bottom-right half as base background
+  cell.style.background = c2 === 'transparent' ? 'var(--panel)' : c2;
+  
+  // Top-left triangle (user1)
+  if (c1 !== 'transparent') {
+    const tri = document.createElement('div');
+    tri.style.cssText = `position:absolute;inset:0;background:${c1};clip-path:polygon(0 0,100% 0,0 100%);`;
+    cell.appendChild(tri);
+  }
+  
+  // User1 label (top-left) - join codes with + for multiple shifts
+  if (sh1.length) {
+    const label1 = sh1.map(s => s.code).join('+');
+    const el1 = document.createElement('div');
+    const big = sh1.length > 1 ? '11' : '14';
+    el1.style.cssText = `position:absolute;top:3px;left:4px;font-size:${big}px;font-weight:700;color:${isColorDark(c1)?'#fff':'#0a0a0a'};z-index:2;line-height:1;text-shadow:0 1px 1px rgba(0,0,0,0.25);`;
+    el1.textContent = label1;
+    cell.appendChild(el1);
+  }
+  
+  // User2 label (bottom-right)
+  if (sh2.length) {
+    const label2 = sh2.map(s => s.code).join('+');
+    const el2 = document.createElement('div');
+    const big = sh2.length > 1 ? '11' : '14';
+    el2.style.cssText = `position:absolute;bottom:3px;right:4px;font-size:${big}px;font-weight:700;color:${isColorDark(c2)?'#fff':'#0a0a0a'};z-index:2;line-height:1;text-shadow:0 1px 1px rgba(0,0,0,0.25);`;
+    el2.textContent = label2;
+    cell.appendChild(el2);
+  }
+  
+  // Day number
+  const num = document.createElement('div');
+  num.className = 'cal-day-num';
+  num.textContent = day;
+  num.style.cssText += 'position:absolute;top:2px;right:4px;z-index:3;';
+  // Color based on whichever half is at top-right (user1's area near corner)
+  num.style.color = (c1 !== 'transparent' && isColorDark(c1)) || (c2 !== 'transparent' && isColorDark(c2)) ? '#fff' : 'var(--text)';
+  
+  // Today circle
+  if (date.toDateString() === today.toDateString()) {
+    num.classList.add('today-circle');
+    num.style.color = '#fff';
+    num.style.top = '2px';
+    num.style.right = '4px';
+    num.style.left = 'auto';
+  }
+  cell.appendChild(num);
+  
+  // Read-only: no onclick
+  cell.style.cursor = 'default';
   return cell;
 }
 
@@ -1280,6 +1397,19 @@ function buildEventDayCell(year, month, day, otherMonth) {
     cell.appendChild(evWrap);
   } else {
     cell.appendChild(num);
+  }
+  
+  // Today circle (applied last so it takes priority)
+  if (date.toDateString() === today.toDateString()) {
+    num.classList.add('today-circle');
+    num.style.color = '#fff';
+    if (dayEvents.length) {
+      // override the corner positioning to keep circle visible
+      num.style.position = 'absolute';
+      num.style.top = '3px';
+      num.style.right = '4px';
+      num.style.zIndex = '3';
+    }
   }
   
   cell.onclick = () => openEventDaySheet(date);
@@ -2912,6 +3042,12 @@ let currentPage = 'calendar';
 
 function switchPage(page, btnEl, fromMore) {
   currentPage = page;
+  // "both" combined view only works on calendar; switch to user1 elsewhere
+  if (page !== 'calendar' && state.currentUser === 'both') {
+    state.currentUser = localStorage.getItem(STORAGE_KEY_LAST_USER) || 'user1';
+    if (!state.users[state.currentUser]) state.currentUser = 'user1';
+    renderUserTabs();
+  }
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   const target = document.getElementById('page-' + page);
   if (target) target.classList.add('active');
