@@ -68,6 +68,10 @@ let firebaseStorage = null;
 let firebaseConnected = false;
 let unsubscribers = [];
 let suppressFirebaseWrite = false;
+let initialDataLoaded = false; // true solo cuando la carga inicial desde Firebase ha terminado
+let isOfflineMode = false;     // true cuando mostramos la copia local por falta de conexión
+let appShown = false;          // true cuando ya se ha mostrado la app
+let offlineFallbackTimer = null;
 let chartInstances = {};
 
 // ==========================================================================
@@ -79,23 +83,78 @@ window.addEventListener('firebaseReady', () => { firebase = window.firebase; try
 function init() {
   applyTheme(localStorage.getItem(STORAGE_KEY_THEME) || 'dark');
   const cfg = localStorage.getItem(STORAGE_KEY_CONFIG);
+  const localData = localStorage.getItem(STORAGE_KEY_LOCAL);
+  
   if (cfg) {
     document.getElementById('firebaseConfigInput').value = cfg;
     tryConnectFirebase();
+    // Plan B: si en 7 segundos Firebase no ha respondido, mostrar la copia local
+    if (localData) {
+      offlineFallbackTimer = setTimeout(() => {
+        if (!initialDataLoaded && !appShown) {
+          enterOfflineMode();
+        }
+      }, 7000);
+    }
   }
   
-  // If no config and skipped before, load local
-  const localData = localStorage.getItem(STORAGE_KEY_LOCAL);
+  // Sin config (modo local puro)
   if (localData && !cfg) {
     try {
       const parsed = JSON.parse(localData);
       mergeStateData(parsed);
+      initialDataLoaded = true;
       showApp();
     } catch (e) { console.warn('Could not parse local data', e); }
   }
   
+  // Detectar recuperación de conexión
+  window.addEventListener('online', () => {
+    if (isOfflineMode) {
+      toast('Conexión recuperada. Recargando...', 'success');
+      setTimeout(() => location.reload(), 1200);
+    }
+  });
+  window.addEventListener('offline', () => {
+    if (!isOfflineMode) showOfflineBanner(true);
+  });
+  
   // Ask for notification permission on first interaction
   setTimeout(checkNotificationPermission, 2000);
+}
+
+// Muestra la app con los datos guardados en el móvil (sin conexión)
+function enterOfflineMode() {
+  const localData = localStorage.getItem(STORAGE_KEY_LOCAL);
+  if (!localData) {
+    toast('Sin conexión y sin copia local disponible', 'error');
+    return;
+  }
+  try {
+    const parsed = JSON.parse(localData);
+    mergeStateData(parsed);
+  } catch (e) {
+    console.warn('No se pudo leer la copia local', e);
+    return;
+  }
+  isOfflineMode = true;
+  initialDataLoaded = false; // no permitir escrituras que puedan machacar la nube
+  showApp();
+  updateSyncDot(false);
+  showOfflineBanner(true);
+}
+
+function showOfflineBanner(show) {
+  let banner = document.getElementById('offlineBanner');
+  if (!banner && show) {
+    banner = document.createElement('div');
+    banner.id = 'offlineBanner';
+    banner.style.cssText = 'background:var(--warning);color:#000;font-size:12px;font-weight:600;text-align:center;padding:6px 12px;';
+    banner.textContent = '📴 Sin conexión · viendo copia guardada (no se pueden guardar cambios)';
+    const header = document.getElementById('header');
+    if (header && header.parentNode) header.parentNode.insertBefore(banner, header.nextSibling);
+  }
+  if (banner) banner.style.display = show ? 'block' : 'none';
 }
 
 function tryConnectFirebase() {
@@ -132,14 +191,28 @@ function tryConnectFirebase() {
         if (!state.users[uid].tenure.periods) state.users[uid].tenure.periods = [];
         normalizeDays(state.users[uid]);
       }
+      initialDataLoaded = true; // ya es seguro escribir
+      isOfflineMode = false;
+      if (offlineFallbackTimer) { clearTimeout(offlineFallbackTimer); offlineFallbackTimer = null; }
+      showOfflineBanner(false);
+      backupEventsLocally();
+      cacheDataLocally();
       setupFirebaseSync();
       showApp();
       updateSyncDot(true);
     }).catch(err => {
       console.error('Initial fetch error', err);
-      setupFirebaseSync();
-      showApp();
-      updateSyncDot(true);
+      // NO marcamos initialDataLoaded: así ninguna escritura podrá borrar datos remotos
+      if (offlineFallbackTimer) { clearTimeout(offlineFallbackTimer); offlineFallbackTimer = null; }
+      const localData = localStorage.getItem(STORAGE_KEY_LOCAL);
+      if (localData && !appShown) {
+        enterOfflineMode();
+      } else {
+        setupFirebaseSync();
+        showApp();
+        updateSyncDot(false);
+        toast('No se han podido cargar los datos. Recarga la app antes de editar.', 'error');
+      }
     });
     });
   } catch (err) {
@@ -192,6 +265,7 @@ function saveFirebaseConfig() {
 }
 
 function skipFirebase() {
+  initialDataLoaded = true;
   showApp();
   updateSyncDot(false);
   toast('Modo local. Los datos solo se guardarán en este móvil.', 'info');
@@ -220,6 +294,7 @@ function showApp() {
 }
 
 function showAppContent() {
+  appShown = true;
   document.getElementById('pinScreen').style.display = 'none';
   document.getElementById('header').style.display = 'flex';
   document.getElementById('userTabs').style.display = 'flex';
@@ -527,6 +602,7 @@ function setupFirebaseSync() {
         if (!state.users[uid].vacations) state.users[uid].vacations = { totalPerYear: 22, ldPerYear: 0 };
         // Normalize days to multi-shift format
         normalizeDays(state.users[uid]);
+        cacheDataLocally();
         renderAll();
       }
     });
@@ -539,6 +615,8 @@ function setupFirebaseSync() {
     const val = snap.val();
     if (!suppressFirebaseWrite) {
       state.events = val || {};
+      backupEventsLocally();
+      cacheDataLocally();
       if (currentPage === 'events') renderEvents();
       renderCalendar();
     }
@@ -581,17 +659,78 @@ function saveUser(uid) {
   // Always cache locally
   localStorage.setItem(STORAGE_KEY_LOCAL, JSON.stringify({ users: state.users, events: state.events, appConfig: state.appConfig }));
   if (!firebaseConnected) return;
+  // Safety: never overwrite remote data if the initial load never completed
+  if (!initialDataLoaded) {
+    console.warn('Escritura bloqueada: datos iniciales no cargados');
+    toast(isOfflineMode ? 'Sin conexión: no se pueden guardar cambios' : 'Aún cargando datos, espera unos segundos', 'error');
+    return;
+  }
   suppressFirebaseWrite = true;
   firebase.set(firebase.ref(firebaseDb, dbPath(`users/${uid}`)), state.users[uid])
     .then(() => { setTimeout(() => suppressFirebaseWrite = false, 200); })
     .catch(err => { console.error(err); toast('Error guardando: ' + err.message, 'error'); suppressFirebaseWrite = false; });
 }
 
-function saveEvents() {
+// Guarda UN evento concreto (no toca el resto)
+function saveSingleEvent(eventId) {
   localStorage.setItem(STORAGE_KEY_LOCAL, JSON.stringify({ users: state.users, events: state.events, appConfig: state.appConfig }));
+  backupEventsLocally();
+  if (!firebaseConnected) return;
+  if (!initialDataLoaded) {
+    toast(isOfflineMode ? 'Sin conexión: no se pueden guardar cambios' : 'Aún cargando datos, espera unos segundos', 'error');
+    return;
+  }
+  suppressFirebaseWrite = true;
+  firebase.set(firebase.ref(firebaseDb, dbPath(`events/${eventId}`)), state.events[eventId])
+    .then(() => { setTimeout(() => suppressFirebaseWrite = false, 200); })
+    .catch(err => { console.error(err); toast('Error guardando: ' + err.message, 'error'); suppressFirebaseWrite = false; });
+}
+
+// Borra UN evento concreto (no toca el resto)
+function deleteSingleEvent(eventId) {
+  localStorage.setItem(STORAGE_KEY_LOCAL, JSON.stringify({ users: state.users, events: state.events, appConfig: state.appConfig }));
+  backupEventsLocally();
   if (!firebaseConnected) return;
   suppressFirebaseWrite = true;
-  firebase.set(firebase.ref(firebaseDb, dbPath('events')), state.events)
+  firebase.remove(firebase.ref(firebaseDb, dbPath(`events/${eventId}`)))
+    .then(() => { setTimeout(() => suppressFirebaseWrite = false, 200); })
+    .catch(err => { console.error(err); toast('Error borrando: ' + err.message, 'error'); suppressFirebaseWrite = false; });
+}
+
+// Guarda una copia completa en el móvil para poder ver la app sin conexión
+function cacheDataLocally() {
+  try {
+    localStorage.setItem(STORAGE_KEY_LOCAL, JSON.stringify({
+      users: state.users,
+      events: state.events,
+      appConfig: state.appConfig,
+      cachedAt: Date.now()
+    }));
+  } catch (e) { console.warn('No se pudo guardar la copia local', e); }
+}
+
+// Copia de seguridad local de eventos (histórico acumulado, nunca se vacía sola)
+function backupEventsLocally() {
+  try {
+    const prev = JSON.parse(localStorage.getItem('turnos-events-backup') || '{}');
+    const merged = { ...prev, ...state.events };
+    localStorage.setItem('turnos-events-backup', JSON.stringify(merged));
+  } catch (e) { console.warn('Backup local falló', e); }
+}
+
+// Mantengo saveEvents por compatibilidad, pero ahora escribe evento a evento
+function saveEvents() {
+  localStorage.setItem(STORAGE_KEY_LOCAL, JSON.stringify({ users: state.users, events: state.events, appConfig: state.appConfig }));
+  backupEventsLocally();
+  if (!firebaseConnected) return;
+  if (!initialDataLoaded) {
+    toast(isOfflineMode ? 'Sin conexión: no se pueden guardar cambios' : 'Aún cargando datos, espera unos segundos', 'error');
+    return;
+  }
+  suppressFirebaseWrite = true;
+  const updates = {};
+  Object.keys(state.events).forEach(id => { updates[id] = state.events[id]; });
+  firebase.update(firebase.ref(firebaseDb, dbPath('events')), updates)
     .then(() => { setTimeout(() => suppressFirebaseWrite = false, 200); })
     .catch(err => { console.error(err); toast('Error guardando: ' + err.message, 'error'); suppressFirebaseWrite = false; });
 }
@@ -1320,7 +1459,8 @@ function renderEvents() {
   const list = document.getElementById('eventsList');
   list.innerHTML = '';
   const now = new Date();
-  const futureEvents = Object.values(state.events)
+  const allEvents = Object.values(state.events);
+  const futureEvents = allEvents
     .filter(e => new Date(e.date + 'T' + (e.time || '23:59')) >= now)
     .sort((a,b) => {
       const ad = a.date + (a.time || '00:00');
@@ -1331,10 +1471,46 @@ function renderEvents() {
   
   if (!futureEvents.length) {
     list.innerHTML = '<div class="empty" style="padding:24px 12px;"><div class="empty-icon">📅</div><div class="empty-desc">Sin eventos próximos</div></div>';
-    return;
+  } else {
+    futureEvents.forEach(ev => list.appendChild(buildEventEl(ev)));
   }
   
-  futureEvents.forEach(ev => list.appendChild(buildEventEl(ev)));
+  // Past events (collapsible)
+  const pastEvents = allEvents
+    .filter(e => new Date(e.date + 'T' + (e.time || '23:59')) < now)
+    .sort((a,b) => {
+      const ad = a.date + (a.time || '00:00');
+      const bd = b.date + (b.time || '00:00');
+      return bd.localeCompare(ad); // más recientes primero
+    });
+  
+  if (pastEvents.length) {
+    const wrap = document.createElement('div');
+    wrap.style.marginTop = '18px';
+    const header = document.createElement('div');
+    header.className = 'section-title';
+    header.style.cssText = 'display:flex;align-items:center;justify-content:space-between;cursor:pointer;margin-bottom:8px;';
+    header.innerHTML = `<span>Eventos pasados (${pastEvents.length})</span><span id="pastToggleIcon" style="font-size:14px;">${window._showPastEvents ? '▲' : '▼'}</span>`;
+    header.onclick = () => { window._showPastEvents = !window._showPastEvents; renderEvents(); };
+    wrap.appendChild(header);
+    
+    if (window._showPastEvents) {
+      const inner = document.createElement('div');
+      pastEvents.slice(0, 50).forEach(ev => {
+        const el = buildEventEl(ev, true);
+        inner.appendChild(el);
+      });
+      if (pastEvents.length > 50) {
+        const more = document.createElement('div');
+        more.className = 'muted';
+        more.style.cssText = 'font-size:12px;text-align:center;padding:8px;';
+        more.textContent = `…y ${pastEvents.length - 50} más (consúltalos en el calendario)`;
+        inner.appendChild(more);
+      }
+      wrap.appendChild(inner);
+    }
+    list.appendChild(wrap);
+  }
 }
 
 function buildEventDayCell(year, month, day, otherMonth) {
@@ -1533,7 +1709,7 @@ function saveEvent(eventId) {
     id, title, date, time: time || null, description: desc || null,
     notifyMinutes: notify === '' ? null : parseInt(notify)
   };
-  saveEvents();
+  saveSingleEvent(id);
   closeModal();
   renderEvents();
   renderCalendar();
@@ -1544,7 +1720,7 @@ function saveEvent(eventId) {
 function deleteEvent(eventId) {
   if (!confirm('¿Eliminar este evento?')) return;
   delete state.events[eventId];
-  saveEvents();
+  deleteSingleEvent(eventId);
   closeModal();
   renderEvents();
   renderCalendar();
@@ -2735,6 +2911,13 @@ function openSettings() {
         <div><div class="settings-row-title">📥 Importar datos</div></div>
         <div class="settings-row-value">›</div>
       </div>
+      <div class="settings-row" onclick="restoreEventsFromBackup()">
+        <div>
+          <div class="settings-row-title">♻️ Restaurar eventos de copia local</div>
+          <div class="settings-row-desc">Recupera eventos guardados en este móvil</div>
+        </div>
+        <div class="settings-row-value">›</div>
+      </div>
     </div>
     
     <div class="settings-section" style="margin:0;">
@@ -2801,6 +2984,51 @@ function exportAllData() {
   a.click();
   URL.revokeObjectURL(url);
   toast('Datos exportados', 'success');
+}
+
+function restoreEventsFromBackup() {
+  let backup = {};
+  try {
+    backup = JSON.parse(localStorage.getItem('turnos-events-backup') || '{}');
+  } catch (e) { backup = {}; }
+  
+  const backupIds = Object.keys(backup);
+  if (!backupIds.length) {
+    toast('No hay copia local de eventos en este móvil', 'error');
+    return;
+  }
+  
+  // Cuáles faltan actualmente
+  const missing = backupIds.filter(id => !state.events[id]);
+  
+  if (!missing.length) {
+    toast(`Copia local con ${backupIds.length} eventos. No falta ninguno.`, 'success');
+    return;
+  }
+  
+  const list = missing.slice(0, 15).map(id => {
+    const ev = backup[id];
+    return `<div style="padding:6px 0;border-bottom:1px solid var(--border);font-size:13px;">
+      <strong>${escapeHtml(ev.title || 'Sin título')}</strong>
+      <div class="muted" style="font-size:11px;">${escapeHtml(ev.date || '')}${ev.time ? ' · ' + escapeHtml(ev.time) : ''}</div>
+    </div>`;
+  }).join('');
+  
+  openModal('Restaurar eventos', `
+    <p class="muted" style="margin-top:0;">Se han encontrado <strong>${missing.length}</strong> eventos en la copia local de este móvil que no están en la nube:</p>
+    <div style="max-height:260px;overflow-y:auto;">${list}</div>
+    ${missing.length > 15 ? `<p class="muted" style="font-size:12px;">…y ${missing.length - 15} más</p>` : ''}
+  `, [
+    { text: 'Cancelar', class: 'btn-secondary', onClick: closeModal },
+    { text: 'Restaurar', onClick: () => {
+      missing.forEach(id => { state.events[id] = backup[id]; });
+      saveEvents();
+      closeModal();
+      renderEvents();
+      renderCalendar();
+      toast(`${missing.length} eventos restaurados`, 'success');
+    }}
+  ]);
 }
 
 function importDataPrompt() {
