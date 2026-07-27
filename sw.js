@@ -1,4 +1,4 @@
-const CACHE = 'turnos-v14';
+const CACHE = 'turnos-v15';
 const ASSETS = [
   './',
   './index.html',
@@ -8,7 +8,7 @@ const ASSETS = [
   './icons/icon-512.png'
 ];
 
-// Dominios de librerías externas que queremos guardar para uso sin conexión
+// Librerías externas que guardamos para poder funcionar sin conexión
 const CDN_HOSTS = [
   'www.gstatic.com',
   'cdn.jsdelivr.net',
@@ -29,11 +29,15 @@ self.addEventListener('activate', e => {
   );
 });
 
+self.addEventListener('message', e => {
+  if (e.data === 'SKIP_WAITING') self.skipWaiting();
+});
+
 self.addEventListener('fetch', e => {
   if (e.request.method !== 'GET') return;
   const url = new URL(e.request.url);
 
-  // Llamadas a la base de datos: siempre red (no tiene sentido cachearlas)
+  // Base de datos: siempre red
   const isDatabase = url.hostname.includes('firebaseio.com')
     || url.hostname.includes('firebasedatabase.app')
     || url.hostname.includes('googleapis.com');
@@ -43,43 +47,34 @@ self.addEventListener('fetch', e => {
     return;
   }
 
-  // Librerías externas (Firebase SDK, Chart.js, fuentes...): cache primero, y refresca en segundo plano
+  // Librerías externas: caché primero (no cambian nunca)
   if (CDN_HOSTS.some(h => url.hostname === h || url.hostname.endsWith('.' + h))) {
     e.respondWith(
       caches.match(e.request).then(cached => {
-        const network = fetch(e.request).then(resp => {
+        if (cached) return cached;
+        return fetch(e.request).then(resp => {
           if (resp && (resp.status === 200 || resp.type === 'opaque')) {
             const clone = resp.clone();
             caches.open(CACHE).then(c => c.put(e.request, clone));
           }
           return resp;
-        }).catch(() => cached);
-        return cached || network;
+        });
       })
     );
     return;
   }
 
-  // Archivos propios de la app: cache primero
+  // Archivos propios de la app: RED PRIMERO, caché solo si no hay conexión.
+  // Así una actualización en GitHub se aplica en cuanto abres la app con datos.
   e.respondWith(
-    caches.match(e.request).then(cached => {
-      if (cached) {
-        // Refrescar en segundo plano
-        fetch(e.request).then(resp => {
-          if (resp && resp.status === 200) {
-            const clone = resp.clone();
-            caches.open(CACHE).then(c => c.put(e.request, clone));
-          }
-        }).catch(() => {});
-        return cached;
+    fetch(e.request).then(resp => {
+      if (resp && resp.status === 200) {
+        const clone = resp.clone();
+        caches.open(CACHE).then(c => c.put(e.request, clone));
       }
-      return fetch(e.request).then(resp => {
-        if (resp && resp.status === 200) {
-          const clone = resp.clone();
-          caches.open(CACHE).then(c => c.put(e.request, clone));
-        }
-        return resp;
-      }).catch(() => caches.match('./index.html'));
+      return resp;
+    }).catch(() => {
+      return caches.match(e.request).then(cached => cached || caches.match('./index.html'));
     })
   );
 });
