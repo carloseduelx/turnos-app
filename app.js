@@ -32,6 +32,9 @@ const PIN_MAX_FAILS = 5;
 const PIN_LOCK_MINUTES = 5;
 const PIN_SESSION_MINUTES = 60 * 12; // re-pedir PIN tras 12h de inactividad
 
+// Versión de la app (sirve para comprobar que ambos móviles están actualizados)
+const APP_VERSION = 'v15';
+
 // Clave secreta para proteger la base de datos (debe coincidir con las reglas de Firebase)
 const DB_SECRET = '69bb413f8347c76ad8613fb53f8778a7df477b726fca2f11';
 // Helper: antepone la rama segura a cualquier ruta
@@ -242,7 +245,12 @@ async function migrateOldDataIfNeeded() {
     const writes = [];
     if (oldU1.exists()) writes.push(firebase.set(firebase.ref(firebaseDb, dbPath('users/user1')), oldU1.val()));
     if (oldU2.exists()) writes.push(firebase.set(firebase.ref(firebaseDb, dbPath('users/user2')), oldU2.val()));
-    if (oldEv.exists()) writes.push(firebase.set(firebase.ref(firebaseDb, dbPath('events')), oldEv.val()));
+    if (oldEv.exists()) {
+      const evs = oldEv.val() || {};
+      Object.keys(evs).forEach(id => {
+        writes.push(firebase.set(firebase.ref(firebaseDb, dbPath(`events/${id}`)), evs[id]));
+      });
+    }
     if (oldCfg.exists()) writes.push(firebase.set(firebase.ref(firebaseDb, dbPath('appConfig')), oldCfg.val()));
     await Promise.all(writes);
     console.log('Datos migrados a la rama segura');
@@ -728,9 +736,11 @@ function saveEvents() {
     return;
   }
   suppressFirebaseWrite = true;
-  const updates = {};
-  Object.keys(state.events).forEach(id => { updates[id] = state.events[id]; });
-  firebase.update(firebase.ref(firebaseDb, dbPath('events')), updates)
+  // Escribir evento a evento: nunca se toca la lista completa
+  const writes = Object.keys(state.events).map(id =>
+    firebase.set(firebase.ref(firebaseDb, dbPath(`events/${id}`)), state.events[id])
+  );
+  Promise.all(writes)
     .then(() => { setTimeout(() => suppressFirebaseWrite = false, 200); })
     .catch(err => { console.error(err); toast('Error guardando: ' + err.message, 'error'); suppressFirebaseWrite = false; });
 }
@@ -2928,12 +2938,20 @@ function openSettings() {
         </div>
         <div class="settings-row-value">›</div>
       </div>
+      <div class="settings-row" onclick="forceUpdate()">
+        <div>
+          <div class="settings-row-title">🔄 Forzar actualización</div>
+          <div class="settings-row-desc">Descarga la última versión publicada</div>
+        </div>
+        <div class="settings-row-value">${APP_VERSION}</div>
+      </div>
       <div class="settings-row" onclick="resetAllData()">
         <div>
           <div class="settings-row-title" style="color:var(--danger);">🗑️ Borrar todos los datos</div>
         </div>
       </div>
     </div>
+    <div class="muted" style="text-align:center;font-size:11px;margin-top:10px;">Versión ${APP_VERSION} · ${firebaseConnected ? (isOfflineMode ? 'sin conexión' : 'conectado') : 'local'}</div>
   `, [{ text: 'Cerrar', class: 'btn-secondary', onClick: closeModal }]);
 }
 
@@ -2969,9 +2987,30 @@ function resetAllData() {
   if (!confirm('¿Estás seguro? Se eliminarán turnos, nóminas, eventos y configuración.')) return;
   localStorage.clear();
   if (firebaseConnected) {
-    firebase.remove(firebase.ref(firebaseDb, dbPath())).catch(()=>{});
+    // Borrar rama por rama (las reglas no permiten borrar la lista de eventos de golpe)
+    firebase.remove(firebase.ref(firebaseDb, dbPath('users'))).catch(()=>{});
+    firebase.remove(firebase.ref(firebaseDb, dbPath('appConfig'))).catch(()=>{});
+    Object.keys(state.events || {}).forEach(id => {
+      firebase.remove(firebase.ref(firebaseDb, dbPath(`events/${id}`))).catch(()=>{});
+    });
   }
-  location.reload();
+  setTimeout(() => location.reload(), 600);
+}
+
+// Fuerza la descarga de la última versión (borra caché y reinstala el service worker)
+async function forceUpdate() {
+  if (!confirm('¿Forzar actualización? La app se recargará con la última versión.')) return;
+  try {
+    if ('caches' in window) {
+      const keys = await caches.keys();
+      await Promise.all(keys.map(k => caches.delete(k)));
+    }
+    if ('serviceWorker' in navigator) {
+      const regs = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(regs.map(r => r.unregister()));
+    }
+  } catch (e) { console.warn(e); }
+  location.reload(true);
 }
 
 function exportAllData() {
