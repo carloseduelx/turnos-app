@@ -33,7 +33,7 @@ const PIN_LOCK_MINUTES = 5;
 const PIN_SESSION_MINUTES = 60 * 12; // re-pedir PIN tras 12h de inactividad
 
 // Versión de la app (sirve para comprobar que ambos móviles están actualizados)
-const APP_VERSION = 'v15';
+const APP_VERSION = 'v16';
 
 // Clave secreta para proteger la base de datos (debe coincidir con las reglas de Firebase)
 const DB_SECRET = '69bb413f8347c76ad8613fb53f8778a7df477b726fca2f11';
@@ -619,15 +619,15 @@ function setupFirebaseSync() {
   
   // Listen to events
   const eR = firebase.ref(firebaseDb, dbPath('events'));
+  // Los eventos se guardan uno a uno, así que siempre aceptamos lo que llega de la nube
+  // (antes se ignoraban cambios mientras se guardaba un turno y la copia se quedaba incompleta)
   firebase.onValue(eR, snap => {
     const val = snap.val();
-    if (!suppressFirebaseWrite) {
-      state.events = val || {};
-      backupEventsLocally();
-      cacheDataLocally();
-      if (currentPage === 'events') renderEvents();
-      renderCalendar();
-    }
+    state.events = val || {};
+    backupEventsLocally();
+    cacheDataLocally();
+    if (currentPage === 'events') renderEvents();
+    renderCalendar();
   });
   
   // Listen to app config (PIN)
@@ -694,15 +694,15 @@ function saveSingleEvent(eventId) {
     .catch(err => { console.error(err); toast('Error guardando: ' + err.message, 'error'); suppressFirebaseWrite = false; });
 }
 
-// Borra UN evento concreto (no toca el resto)
+// Eventos visibles (excluye los enviados a la papelera)
+function activeEvents() {
+  return Object.values(state.events || {}).filter(e => e && !e.deleted && e.date);
+}
+
+// "Borra" UN evento: lo marca como eliminado (papelera). Nunca se elimina de la base de datos,
+// así es imposible perder eventos por error.
 function deleteSingleEvent(eventId) {
-  localStorage.setItem(STORAGE_KEY_LOCAL, JSON.stringify({ users: state.users, events: state.events, appConfig: state.appConfig }));
-  backupEventsLocally();
-  if (!firebaseConnected) return;
-  suppressFirebaseWrite = true;
-  firebase.remove(firebase.ref(firebaseDb, dbPath(`events/${eventId}`)))
-    .then(() => { setTimeout(() => suppressFirebaseWrite = false, 200); })
-    .catch(err => { console.error(err); toast('Error borrando: ' + err.message, 'error'); suppressFirebaseWrite = false; });
+  saveSingleEvent(eventId);
 }
 
 // Guarda una copia completa en el móvil para poder ver la app sin conexión
@@ -928,7 +928,7 @@ function buildDayCell(year, month, day, otherMonth) {
   }
   
   // Event dot
-  const dayEvents = Object.values(state.events).filter(e => e.date === dateKey);
+  const dayEvents = activeEvents().filter(e => e.date === dateKey);
   if (dayEvents.length) {
     const evDot = document.createElement('div');
     evDot.className = 'cal-day-event';
@@ -1050,7 +1050,7 @@ function openDaySheet(date) {
   const dayData = user.days[dateKey] || {};
   const dayShifts = dayData.shifts || [];
   const note = user.notes[dateKey] || '';
-  const dayEvents = Object.values(state.events).filter(e => e.date === dateKey);
+  const dayEvents = activeEvents().filter(e => e.date === dateKey);
   
   document.getElementById('daySheetTitle').textContent = date.toLocaleDateString('es-ES', { weekday: 'long', day: 'numeric', month: 'long' });
   document.getElementById('daySheetSubtitle').textContent = date.getFullYear();
@@ -1469,7 +1469,7 @@ function renderEvents() {
   const list = document.getElementById('eventsList');
   list.innerHTML = '';
   const now = new Date();
-  const allEvents = Object.values(state.events);
+  const allEvents = activeEvents();
   const futureEvents = allEvents
     .filter(e => new Date(e.date + 'T' + (e.time || '23:59')) >= now)
     .sort((a,b) => {
@@ -1536,7 +1536,7 @@ function buildEventDayCell(year, month, day, otherMonth) {
   if (date.toDateString() === today.toDateString()) cell.classList.add('today');
   
   // Get events for this day
-  const dayEvents = Object.values(state.events).filter(e => e.date === dateKey);
+  const dayEvents = activeEvents().filter(e => e.date === dateKey);
   
   const num = document.createElement('div');
   num.className = 'cal-day-num';
@@ -1619,7 +1619,7 @@ function goToEventToday() {
 function openEventDaySheet(date) {
   state.evSelectedDate = date;
   const dateKey = formatDate(date);
-  const dayEvents = Object.values(state.events).filter(e => e.date === dateKey);
+  const dayEvents = activeEvents().filter(e => e.date === dateKey);
   
   document.getElementById('daySheetTitle').textContent = date.toLocaleDateString('es-ES', { weekday: 'long', day: 'numeric', month: 'long' });
   document.getElementById('daySheetSubtitle').textContent = date.getFullYear();
@@ -1728,8 +1728,9 @@ function saveEvent(eventId) {
 }
 
 function deleteEvent(eventId) {
-  if (!confirm('¿Eliminar este evento?')) return;
-  delete state.events[eventId];
+  if (!confirm('¿Eliminar este evento?\n\nIrá a la papelera (Ajustes → Papelera de eventos) por si quieres recuperarlo.')) return;
+  if (!state.events[eventId]) return;
+  state.events[eventId] = { ...state.events[eventId], deleted: true, deletedAt: Date.now() };
   deleteSingleEvent(eventId);
   closeModal();
   renderEvents();
@@ -2921,6 +2922,13 @@ function openSettings() {
         <div><div class="settings-row-title">📥 Importar datos</div></div>
         <div class="settings-row-value">›</div>
       </div>
+      <div class="settings-row" onclick="openEventTrash()">
+        <div>
+          <div class="settings-row-title">🗑️ Papelera de eventos</div>
+          <div class="settings-row-desc">Recupera eventos eliminados</div>
+        </div>
+        <div class="settings-row-value">›</div>
+      </div>
       <div class="settings-row" onclick="restoreEventsFromBackup()">
         <div>
           <div class="settings-row-title">♻️ Restaurar eventos de copia local</div>
@@ -2991,7 +2999,8 @@ function resetAllData() {
     firebase.remove(firebase.ref(firebaseDb, dbPath('users'))).catch(()=>{});
     firebase.remove(firebase.ref(firebaseDb, dbPath('appConfig'))).catch(()=>{});
     Object.keys(state.events || {}).forEach(id => {
-      firebase.remove(firebase.ref(firebaseDb, dbPath(`events/${id}`))).catch(()=>{});
+      const ev = { ...state.events[id], deleted: true, deletedAt: Date.now() };
+      firebase.set(firebase.ref(firebaseDb, dbPath(`events/${id}`)), ev).catch(()=>{});
     });
   }
   setTimeout(() => location.reload(), 600);
@@ -3023,6 +3032,45 @@ function exportAllData() {
   a.click();
   URL.revokeObjectURL(url);
   toast('Datos exportados', 'success');
+}
+
+function openEventTrash() {
+  const trashed = Object.values(state.events || {})
+    .filter(e => e && e.deleted)
+    .sort((a, b) => (b.deletedAt || 0) - (a.deletedAt || 0));
+
+  if (!trashed.length) {
+    toast('La papelera está vacía', 'info');
+    return;
+  }
+
+  const list = trashed.slice(0, 40).map(ev => `
+    <div style="display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--border);">
+      <div style="flex:1;min-width:0;">
+        <div style="font-weight:600;font-size:13px;">${escapeHtml(ev.title || 'Sin título')}</div>
+        <div class="muted" style="font-size:11px;">${escapeHtml(ev.date || '')}${ev.time ? ' · ' + escapeHtml(ev.time) : ''}</div>
+      </div>
+      <button class="btn btn-sm" onclick="restoreTrashedEvent('${ev.id}')">Recuperar</button>
+    </div>
+  `).join('');
+
+  openModal('Papelera de eventos', `<div style="max-height:320px;overflow-y:auto;">${list}</div>`,
+    [{ text: 'Cerrar', class: 'btn-secondary', onClick: closeModal }]);
+}
+
+function restoreTrashedEvent(id) {
+  const ev = state.events[id];
+  if (!ev) return;
+  const restored = { ...ev };
+  delete restored.deleted;
+  delete restored.deletedAt;
+  state.events[id] = restored;
+  saveSingleEvent(id);
+  renderEvents();
+  renderCalendar();
+  toast('Evento recuperado', 'success');
+  closeModal();
+  setTimeout(openEventTrash, 150);
 }
 
 function restoreEventsFromBackup() {
@@ -3287,7 +3335,7 @@ function scheduleNotifications() {
   }
   
   // Schedule event notifications
-  Object.values(state.events).forEach(ev => {
+  activeEvents().forEach(ev => {
     if (ev.notifyMinutes == null) return;
     const evTime = ev.time || '09:00';
     const evDate = new Date(ev.date + 'T' + evTime);
