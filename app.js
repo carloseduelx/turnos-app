@@ -33,7 +33,7 @@ const PIN_LOCK_MINUTES = 5;
 const PIN_SESSION_MINUTES = 60 * 12; // re-pedir PIN tras 12h de inactividad
 
 // Versión de la app (sirve para comprobar que ambos móviles están actualizados)
-const APP_VERSION = 'v16';
+const APP_VERSION = 'v17';
 
 // Clave secreta para proteger la base de datos (debe coincidir con las reglas de Firebase)
 const DB_SECRET = '69bb413f8347c76ad8613fb53f8778a7df477b726fca2f11';
@@ -195,6 +195,7 @@ function tryConnectFirebase() {
         normalizeDays(state.users[uid]);
       }
       initialDataLoaded = true; // ya es seguro escribir
+      restoreUnconfirmedDeletions();
       isOfflineMode = false;
       if (offlineFallbackTimer) { clearTimeout(offlineFallbackTimer); offlineFallbackTimer = null; }
       showOfflineBanner(false);
@@ -624,6 +625,7 @@ function setupFirebaseSync() {
   firebase.onValue(eR, snap => {
     const val = snap.val();
     state.events = val || {};
+    restoreUnconfirmedDeletions();
     backupEventsLocally();
     cacheDataLocally();
     if (currentPage === 'events') renderEvents();
@@ -692,6 +694,34 @@ function saveSingleEvent(eventId) {
   firebase.set(firebase.ref(firebaseDb, dbPath(`events/${eventId}`)), state.events[eventId])
     .then(() => { setTimeout(() => suppressFirebaseWrite = false, 200); })
     .catch(err => { console.error(err); toast('Error guardando: ' + err.message, 'error'); suppressFirebaseWrite = false; });
+}
+
+// Nombre con el que identificar este móvil (la última persona elegida en él)
+function deviceLabel() {
+  const uid = localStorage.getItem(STORAGE_KEY_LAST_USER) || 'user1';
+  return (state.users[uid] && state.users[uid].name) || uid;
+}
+
+// Devuelve al calendario los eventos que acabaron en la papelera sin que nadie
+// pulsara "Eliminar" (no llevan la marca deletedByUser).
+function restoreUnconfirmedDeletions() {
+  if (!initialDataLoaded) return;
+  const ids = Object.keys(state.events || {}).filter(id => {
+    const ev = state.events[id];
+    // Se recupera si nadie lo borró a mano o si su día ya pasó (los pasados nunca se borran)
+    return ev && ev.deleted && (!ev.deletedByUser || (ev.date && ev.date < formatDate(new Date())));
+  });
+  ids.forEach(id => {
+    const ev = { ...state.events[id] };
+    delete ev.deleted;
+    delete ev.deletedAt;
+    state.events[id] = ev;
+    saveSingleEvent(id);
+  });
+  if (ids.length) {
+    console.log('Eventos recuperados de la papelera:', ids.length);
+    toast(`${ids.length} evento${ids.length === 1 ? '' : 's'} recuperado${ids.length === 1 ? '' : 's'} al calendario`, 'success');
+  }
 }
 
 // Eventos visibles (excluye los enviados a la papelera)
@@ -1544,7 +1574,9 @@ function buildEventDayCell(year, month, day, otherMonth) {
   
   if (dayEvents.length) {
     // Fill whole cell with blue background
-    cell.style.background = 'var(--info)';
+    // Azul = evento de hoy o futuro · Rojo = el día del evento ya pasó
+    const isPastDay = dateKey < formatDate(today);
+    cell.style.background = isPastDay ? 'var(--danger)' : 'var(--info)';
     num.style.color = '#fff';
     num.style.cssText += ';position:absolute;top:3px;right:5px;z-index:2;text-shadow:0 1px 2px rgba(0,0,0,0.3);';
     cell.appendChild(num);
@@ -1657,7 +1689,10 @@ function buildEventEl(ev, past) {
   const dateStr = d.toLocaleDateString('es-ES', { weekday: 'short', day: 'numeric', month: 'short' });
   const el = document.createElement('div');
   el.className = 'event-item';
-  if (past) el.style.opacity = '0.55';
+  if (past) {
+    el.style.borderLeft = '4px solid var(--danger)';
+    el.style.borderRadius = '0 var(--radius-sm) var(--radius-sm) 0';
+  }
   el.innerHTML = `
     <div class="flex-between">
       <div style="flex:1;min-width:0;">
@@ -1699,7 +1734,8 @@ function openEventEditor(eventId, prefilledDate) {
       <option value="10080">1 semana antes</option>
     </select>
   `, [
-    ...(ev ? [{ text: 'Eliminar', class: 'btn-danger', onClick: () => deleteEvent(eventId) }] : []),
+    // Los eventos cuyo día ya pasó no se pueden eliminar: se quedan en el calendario (en rojo)
+    ...(ev && ev.date >= today ? [{ text: 'Eliminar', class: 'btn-danger', onClick: () => deleteEvent(eventId) }] : []),
     { text: 'Cancelar', class: 'btn-secondary', onClick: closeModal },
     { text: 'Guardar', onClick: () => saveEvent(eventId) }
   ]);
@@ -1730,7 +1766,18 @@ function saveEvent(eventId) {
 function deleteEvent(eventId) {
   if (!confirm('¿Eliminar este evento?\n\nIrá a la papelera (Ajustes → Papelera de eventos) por si quieres recuperarlo.')) return;
   if (!state.events[eventId]) return;
-  state.events[eventId] = { ...state.events[eventId], deleted: true, deletedAt: Date.now() };
+  if (state.events[eventId].date < formatDate(new Date())) {
+    toast('Los eventos pasados no se pueden eliminar', 'error');
+    return;
+  }
+  state.events[eventId] = {
+    ...state.events[eventId],
+    deleted: true,
+    deletedAt: Date.now(),
+    deletedByUser: true,            // solo los borrados confirmados a mano llevan esta marca
+    deletedVersion: APP_VERSION,
+    deletedFrom: deviceLabel()
+  };
   deleteSingleEvent(eventId);
   closeModal();
   renderEvents();
@@ -3049,6 +3096,7 @@ function openEventTrash() {
       <div style="flex:1;min-width:0;">
         <div style="font-weight:600;font-size:13px;">${escapeHtml(ev.title || 'Sin título')}</div>
         <div class="muted" style="font-size:11px;">${escapeHtml(ev.date || '')}${ev.time ? ' · ' + escapeHtml(ev.time) : ''}</div>
+        <div class="muted" style="font-size:10px;margin-top:2px;">Eliminado ${ev.deletedAt ? new Date(ev.deletedAt).toLocaleString('es-ES', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) : ''}${ev.deletedFrom ? ' · desde el móvil de ' + escapeHtml(ev.deletedFrom) : ''}</div>
       </div>
       <button class="btn btn-sm" onclick="restoreTrashedEvent('${ev.id}')">Recuperar</button>
     </div>
